@@ -1,33 +1,42 @@
 import graphene
-import graphene_django_optimizer as gql_optimizer
-from django_countries.fields import Country
 from graphene import relay
 
+from ...core.exceptions import PermissionDenied
+from ...core.permissions import OrderPermissions
+from ...core.tracing import traced_resolver
 from ...payment import models
-from ..account.types import Address
-from ..core.connection import CountableDjangoObjectType
-from ..core.types import Money
-from .enums import OrderAction, PaymentChargeStatusEnum
+from ..checkout.dataloaders import CheckoutByTokenLoader
+from ..core.connection import CountableConnection
+from ..core.descriptions import ADDED_IN_31
+from ..core.fields import JSONString
+from ..core.types import ModelObjectType, Money, NonNullList
+from ..decorators import permission_required
+from ..meta.permissions import public_payment_permissions
+from ..meta.resolvers import resolve_metadata
+from ..meta.types import MetadataItem, ObjectWithMetadata
+from ..utils import get_user_or_app_from_context
+from .enums import OrderAction, PaymentChargeStatusEnum, TransactionKindEnum
 
 
-class Transaction(CountableDjangoObjectType):
+class Transaction(ModelObjectType):
+    id = graphene.GlobalID(required=True)
+    created = graphene.DateTime(required=True)
+    payment = graphene.Field(lambda: Payment, required=True)
+    token = graphene.String(required=True)
+    kind = TransactionKindEnum(required=True)
+    is_success = graphene.Boolean(required=True)
+    error = graphene.String()
+    gateway_response = JSONString(required=True)
     amount = graphene.Field(Money, description="Total amount of the transaction.")
 
     class Meta:
         description = "An object representing a single payment."
         interfaces = [relay.Node]
         model = models.Transaction
-        filter_fields = ["id"]
-        only_fields = [
-            "id",
-            "created",
-            "payment",
-            "token",
-            "kind",
-            "is_success",
-            "error",
-            "gateway_response",
-        ]
+
+    @staticmethod
+    def resolve_created(root: models.Transaction, _info):
+        return root.created_at
 
     @staticmethod
     def resolve_amount(root: models.Transaction, _info):
@@ -37,18 +46,18 @@ class Transaction(CountableDjangoObjectType):
 class CreditCard(graphene.ObjectType):
     brand = graphene.String(description="Card brand.", required=True)
     first_digits = graphene.String(
-        description="The host name of the domain.", required=True
+        description="First 4 digits of the card number.", required=False
     )
     last_digits = graphene.String(
         description="Last 4 digits of the card number.", required=True
     )
     exp_month = graphene.Int(
-        description=("Two-digit number representing the card’s expiration month."),
-        required=True,
+        description="Two-digit number representing the card’s expiration month.",
+        required=False,
     )
     exp_year = graphene.Int(
-        description=("Four-digit number representing the card’s expiration year."),
-        required=True,
+        description="Four-digit number representing the card’s expiration year.",
+        required=False,
     )
 
 
@@ -60,16 +69,35 @@ class PaymentSource(graphene.ObjectType):
         )
 
     gateway = graphene.String(description="Payment gateway name.", required=True)
+    payment_method_id = graphene.String(description="ID of stored payment method.")
     credit_card_info = graphene.Field(
         CreditCard, description="Stored credit card details if available."
     )
+    metadata = NonNullList(
+        MetadataItem,
+        required=True,
+        description=(
+            f"{ADDED_IN_31} List of public metadata items. "
+            "Can be accessed without permissions."
+        ),
+    )
 
 
-class Payment(CountableDjangoObjectType):
+class Payment(ModelObjectType):
+    id = graphene.GlobalID(required=True)
+    gateway = graphene.String(required=True)
+    is_active = graphene.Boolean(required=True)
+    created = graphene.DateTime(required=True)
+    modified = graphene.DateTime(required=True)
+    token = graphene.String(required=True)
+    checkout = graphene.Field("saleor.graphql.checkout.types.Checkout")
+    order = graphene.Field("saleor.graphql.order.types.Order")
+    payment_method_type = graphene.String(required=True)
+    customer_ip_address = graphene.String()
     charge_status = PaymentChargeStatusEnum(
         description="Internal payment status.", required=True
     )
-    actions = graphene.List(
+    actions = NonNullList(
         OrderAction,
         description=(
             "List of actions that can be performed in the current state of a payment."
@@ -80,8 +108,7 @@ class Payment(CountableDjangoObjectType):
     captured_amount = graphene.Field(
         Money, description="Total amount captured for this payment."
     )
-    billing_address = graphene.Field(Address, description="Customer billing address.")
-    transactions = graphene.List(
+    transactions = NonNullList(
         Transaction, description="List of all transactions within this payment."
     )
     available_capture_amount = graphene.Field(
@@ -96,25 +123,24 @@ class Payment(CountableDjangoObjectType):
 
     class Meta:
         description = "Represents a payment of a given type."
-        interfaces = [relay.Node]
+        interfaces = [relay.Node, ObjectWithMetadata]
         model = models.Payment
-        filter_fields = ["id"]
-        only_fields = [
-            "id",
-            "gateway",
-            "is_active",
-            "created",
-            "modified",
-            "token",
-            "checkout",
-            "order",
-            "billing_email",
-            "customer_ip_address",
-            "extra_data",
-        ]
 
     @staticmethod
-    @gql_optimizer.resolver_hints(prefetch_related="transactions")
+    def resolve_created(root: models.Payment, _info):
+        return root.created_at
+
+    @staticmethod
+    def resolve_modified(root: models.Payment, _info):
+        return root.modified_at
+
+    @staticmethod
+    @permission_required(OrderPermissions.MANAGE_ORDERS)
+    def resolve_customer_ip_address(root: models.Payment, _info):
+        return root.customer_ip_address
+
+    @staticmethod
+    @permission_required(OrderPermissions.MANAGE_ORDERS)
     def resolve_actions(root: models.Payment, _info):
         actions = []
         if root.can_capture():
@@ -126,6 +152,7 @@ class Payment(CountableDjangoObjectType):
         return actions
 
     @staticmethod
+    @traced_resolver
     def resolve_total(root: models.Payment, _info):
         return root.get_total()
 
@@ -134,49 +161,64 @@ class Payment(CountableDjangoObjectType):
         return root.get_captured_amount()
 
     @staticmethod
-    def resolve_billing_address(root: models.Payment, _info):
-        return Address(
-            first_name=root.billing_first_name,
-            last_name=root.billing_last_name,
-            company_name=root.billing_company_name,
-            street_address_1=root.billing_address_1,
-            street_address_2=root.billing_address_2,
-            city=root.billing_city,
-            city_area=root.billing_city_area,
-            postal_code=root.billing_postal_code,
-            country=Country(root.billing_country_code),
-            country_area=root.billing_country_area,
-        )
-
-    @staticmethod
-    @gql_optimizer.resolver_hints(prefetch_related="transactions")
+    @permission_required(OrderPermissions.MANAGE_ORDERS)
     def resolve_transactions(root: models.Payment, _info):
         return root.transactions.all()
 
     @staticmethod
+    @permission_required(OrderPermissions.MANAGE_ORDERS)
     def resolve_available_refund_amount(root: models.Payment, _info):
-        # FIXME TESTME
         if not root.can_refund():
             return None
         return root.get_captured_amount()
 
     @staticmethod
-    @gql_optimizer.resolver_hints(prefetch_related="transactions")
+    @permission_required(OrderPermissions.MANAGE_ORDERS)
     def resolve_available_capture_amount(root: models.Payment, _info):
-        # FIXME TESTME
         if not root.can_capture():
             return None
-        return root.get_charge_amount()
+        return Money(amount=root.get_charge_amount(), currency=root.currency)
 
     @staticmethod
     def resolve_credit_card(root: models.Payment, _info):
         data = {
-            "first_digits": root.cc_first_digits,
-            "last_digits": root.cc_last_digits,
             "brand": root.cc_brand,
             "exp_month": root.cc_exp_month,
             "exp_year": root.cc_exp_year,
+            "first_digits": root.cc_first_digits,
+            "last_digits": root.cc_last_digits,
         }
         if not any(data.values()):
             return None
         return CreditCard(**data)
+
+    @staticmethod
+    def resolve_metadata(root: models.Payment, info):
+        permissions = public_payment_permissions(info, root.pk)
+        requester = get_user_or_app_from_context(info.context)
+        if not requester.has_perms(permissions):
+            raise PermissionDenied(permissions=permissions)
+        return resolve_metadata(root.metadata)
+
+    def resolve_checkout(root: models.Payment, info):
+        if not root.checkout_id:
+            return None
+        return CheckoutByTokenLoader(info.context).load(root.checkout_id)
+
+
+class PaymentCountableConnection(CountableConnection):
+    class Meta:
+        node = Payment
+
+
+class PaymentInitialized(graphene.ObjectType):
+    class Meta:
+        description = (
+            "Server-side data generated by a payment gateway. Optional step when the "
+            "payment provider requires an additional action to initialize payment "
+            "session."
+        )
+
+    gateway = graphene.String(description="ID of a payment gateway.", required=True)
+    name = graphene.String(description="Payment gateway name.", required=True)
+    data = JSONString(description="Initialized data by gateway.", required=False)

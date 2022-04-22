@@ -1,7 +1,7 @@
 from django.core.management.base import BaseCommand
-from graphql import print_schema
 
 from ...api import schema
+from ...schema_printer import print_schema
 
 
 class Command(BaseCommand):

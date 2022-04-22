@@ -1,25 +1,31 @@
-from typing import Set
+from typing import Union
 
 from django.conf import settings
+from django.contrib.auth.models import _user_has_perm  # type: ignore
 from django.contrib.auth.models import (
     AbstractBaseUser,
     BaseUserManager,
+    Group,
     Permission,
     PermissionsMixin,
 )
-from django.contrib.postgres.fields import JSONField
+from django.contrib.postgres.indexes import GinIndex
 from django.db import models
-from django.db.models import Q, Value
+from django.db.models import JSONField  # type: ignore
+from django.db.models import Q, QuerySet, Value
+from django.db.models.expressions import Exists, OuterRef
 from django.forms.models import model_to_dict
 from django.utils import timezone
-from django.utils.translation import gettext_lazy as _, pgettext_lazy
+from django.utils.crypto import get_random_string
 from django_countries.fields import Country, CountryField
-from oauthlib.common import generate_token
 from phonenumber_field.modelfields import PhoneNumber, PhoneNumberField
 from versatileimagefield.fields import VersatileImageField
 
+from ..app.models import App
 from ..core.models import ModelWithMetadata
+from ..core.permissions import AccountPermissions, BasePermissionEnum, get_permissions
 from ..core.utils.json_serializer import CustomJsonEncoder
+from ..order.models import Order
 from . import CustomerEvents
 from .validators import validate_possible_number
 
@@ -61,12 +67,20 @@ class Address(models.Model):
     postal_code = models.CharField(max_length=20, blank=True)
     country = CountryField()
     country_area = models.CharField(max_length=128, blank=True)
-    phone = PossiblePhoneNumberField(blank=True, default="")
+    phone = PossiblePhoneNumberField(blank=True, default="", db_index=True)
 
-    objects = AddressQueryset.as_manager()
+    objects = models.Manager.from_queryset(AddressQueryset)()
 
     class Meta:
         ordering = ("pk",)
+        indexes = [
+            GinIndex(
+                name="address_search_gin",
+                # `opclasses` and `fields` should be the same length
+                fields=["first_name", "last_name", "city", "country"],
+                opclasses=["gin_trgm_ops"] * 4,
+            ),
+        ]
 
     @property
     def full_name(self):
@@ -124,8 +138,10 @@ class UserManager(BaseUserManager):
         )
 
     def customers(self):
+        orders = Order.objects.values("user_id")
         return self.get_queryset().filter(
-            Q(is_staff=False) | (Q(is_staff=True) & Q(orders__isnull=False))
+            Q(is_staff=False)
+            | (Q(is_staff=True) & (Exists(orders.filter(user_id=OuterRef("pk")))))
         )
 
     def staff(self):
@@ -143,6 +159,7 @@ class User(PermissionsMixin, ModelWithMetadata, AbstractBaseUser):
     is_active = models.BooleanField(default=True)
     note = models.TextField(null=True, blank=True)
     date_joined = models.DateTimeField(default=timezone.now, editable=False)
+    updated_at = models.DateTimeField(auto_now=True, db_index=True)
     default_shipping_address = models.ForeignKey(
         Address, related_name="+", null=True, blank=True, on_delete=models.SET_NULL
     )
@@ -150,23 +167,88 @@ class User(PermissionsMixin, ModelWithMetadata, AbstractBaseUser):
         Address, related_name="+", null=True, blank=True, on_delete=models.SET_NULL
     )
     avatar = VersatileImageField(upload_to="user-avatars", blank=True, null=True)
+    jwt_token_key = models.CharField(max_length=12, default=get_random_string)
+    language_code = models.CharField(
+        max_length=35, choices=settings.LANGUAGES, default=settings.LANGUAGE_CODE
+    )
+    search_document = models.TextField(blank=True, default="")
 
     USERNAME_FIELD = "email"
 
     objects = UserManager()
 
     class Meta:
+        ordering = ("email",)
         permissions = (
-            (
-                "manage_users",
-                pgettext_lazy("Permission description", "Manage customers."),
-            ),
-            ("manage_staff", pgettext_lazy("Permission description", "Manage staff.")),
-            (
-                "impersonate_users",
-                pgettext_lazy("Permission description", "Impersonate customers."),
-            ),
+            (AccountPermissions.MANAGE_USERS.codename, "Manage customers."),
+            (AccountPermissions.MANAGE_STAFF.codename, "Manage staff."),
+            (AccountPermissions.IMPERSONATE_USER.codename, "Impersonate user."),
         )
+        indexes = [
+            *ModelWithMetadata.Meta.indexes,
+            # Orders searching index
+            GinIndex(
+                name="order_user_search_gin",
+                # `opclasses` and `fields` should be the same length
+                fields=["email", "first_name", "last_name"],
+                opclasses=["gin_trgm_ops"] * 3,
+            ),
+            # Account searching index
+            GinIndex(
+                name="user_search_gin",
+                # `opclasses` and `fields` should be the same length
+                fields=["search_document"],
+                opclasses=["gin_trgm_ops"],
+            ),
+        ]
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._effective_permissions = None
+
+    @property
+    def effective_permissions(self) -> "QuerySet[Permission]":
+        if self._effective_permissions is None:
+            self._effective_permissions = get_permissions()
+            if not self.is_superuser:
+
+                UserPermission = User.user_permissions.through
+                user_permission_queryset = UserPermission.objects.filter(
+                    user_id=self.pk
+                ).values("permission_id")
+
+                UserGroup = User.groups.through
+                GroupPermission = Group.permissions.through
+                user_group_queryset = UserGroup.objects.filter(user_id=self.pk).values(
+                    "group_id"
+                )
+                group_permission_queryset = GroupPermission.objects.filter(
+                    Exists(user_group_queryset.filter(group_id=OuterRef("group_id")))
+                ).values("permission_id")
+
+                self._effective_permissions = self._effective_permissions.filter(
+                    Q(
+                        Exists(
+                            user_permission_queryset.filter(
+                                permission_id=OuterRef("pk")
+                            )
+                        )
+                    )
+                    | Q(
+                        Exists(
+                            group_permission_queryset.filter(
+                                permission_id=OuterRef("pk")
+                            )
+                        )
+                    )
+                )
+        return self._effective_permissions
+
+    @effective_permissions.setter
+    def effective_permissions(self, value: "QuerySet[Permission]"):
+        self._effective_permissions = value
+        # Drop cache for authentication backend
+        self._effective_permissions_cache = None
 
     def get_full_name(self):
         if self.first_name or self.last_name:
@@ -181,63 +263,14 @@ class User(PermissionsMixin, ModelWithMetadata, AbstractBaseUser):
     def get_short_name(self):
         return self.email
 
+    def has_perm(self, perm: Union[BasePermissionEnum, str], obj=None):  # type: ignore
+        # This method is overridden to accept perm as BasePermissionEnum
+        perm = perm.value if hasattr(perm, "value") else perm  # type: ignore
 
-class ServiceAccount(ModelWithMetadata):
-    name = models.CharField(max_length=60)
-    created = models.DateTimeField(auto_now_add=True)
-    is_active = models.BooleanField(default=True)
-    permissions = models.ManyToManyField(
-        Permission,
-        verbose_name=_("service account permissions"),
-        blank=True,
-        help_text=_("Specific permissions for this service."),
-        related_name="service_set",
-        related_query_name="service",
-    )
-
-    class Meta:
-        permissions = (
-            (
-                "manage_service_accounts",
-                pgettext_lazy("Permission description", "Manage service account"),
-            ),
-        )
-
-    def _get_permissions(self) -> Set[str]:
-        """Return the permissions of the service."""
-        if not self.is_active:
-            return set()
-        perm_cache_name = "_service_perm_cache"
-        if not hasattr(self, perm_cache_name):
-            perms = self.permissions.all()
-            perms = perms.values_list("content_type__app_label", "codename").order_by()
-            setattr(self, perm_cache_name, {f"{ct}.{name}" for ct, name in perms})
-        return getattr(self, perm_cache_name)
-
-    def has_perms(self, perm_list):
-        """Return True if the service has each of the specified permissions."""
-        if not self.is_active:
-            return False
-
-        wanted_perms = set(perm_list)
-        actual_perms = self._get_permissions()
-
-        return (wanted_perms & actual_perms) == wanted_perms
-
-    def has_perm(self, perm):
-        """Return True if the service has the specified permission."""
-        if not self.is_active:
-            return False
-
-        return perm in self._get_permissions()
-
-
-class ServiceAccountToken(models.Model):
-    service_account = models.ForeignKey(
-        ServiceAccount, on_delete=models.CASCADE, related_name="tokens"
-    )
-    name = models.CharField(blank=True, default="", max_length=128)
-    auth_token = models.CharField(default=generate_token, unique=True, max_length=30)
+        # Active superusers have all permissions.
+        if self.is_active and self.is_superuser and not self._effective_permissions:
+            return True
+        return _user_has_perm(self, perm, obj)
 
 
 class CustomerNote(models.Model):
@@ -265,11 +298,12 @@ class CustomerEvent(models.Model):
             (type_name.upper(), type_name) for type_name, _ in CustomerEvents.CHOICES
         ],
     )
-
     order = models.ForeignKey("order.Order", on_delete=models.SET_NULL, null=True)
     parameters = JSONField(blank=True, default=dict, encoder=CustomJsonEncoder)
-
-    user = models.ForeignKey(User, related_name="events", on_delete=models.CASCADE)
+    user = models.ForeignKey(
+        User, related_name="events", on_delete=models.CASCADE, null=True
+    )
+    app = models.ForeignKey(App, related_name="+", on_delete=models.SET_NULL, null=True)
 
     class Meta:
         ordering = ("date",)
@@ -288,6 +322,9 @@ class StaffNotificationRecipient(models.Model):
     )
     staff_email = models.EmailField(unique=True, blank=True, null=True)
     active = models.BooleanField(default=True)
+
+    class Meta:
+        ordering = ("staff_email",)
 
     def get_email(self):
         return self.user.email if self.user else self.staff_email

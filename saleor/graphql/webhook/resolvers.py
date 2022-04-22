@@ -1,29 +1,34 @@
-import graphene
-from graphql_jwt.exceptions import PermissionDenied
-
-from ...webhook import WebhookEventType, models, payloads
+from ...core.exceptions import PermissionDenied
+from ...core.permissions import AppPermission
+from ...core.tracing import traced_resolver
+from ...webhook import models, payloads
+from ...webhook.deprecated_event_types import WebhookEventType
+from ...webhook.event_types import WebhookEventAsyncType, WebhookEventSyncType
+from ..core.utils import from_global_id_or_error
 from .types import Webhook, WebhookEvent
 
 
-def resolve_webhooks(info):
-    service_account = info.context.service_account
-    if service_account:
-        return models.Webhook.objects.filter(service_account=service_account)
-    user = info.context.user
-    if not user.has_perm("webhook.manage_webhooks"):
-        raise PermissionDenied()
-    return models.Webhook.objects.all()
+def resolve_webhooks(info, **_kwargs):
+    app = info.context.app
+    if app:
+        qs = models.Webhook.objects.filter(app=app)
+    else:
+        user = info.context.user
+        if not user.has_perm(AppPermission.MANAGE_APPS):
+            raise PermissionDenied(permissions=[AppPermission.MANAGE_APPS])
+        qs = models.Webhook.objects.all()
+    return qs
 
 
-def resolve_webhook(info, webhook_id):
-    service_account = info.context.service_account
-    if service_account:
-        _, webhook_id = graphene.Node.from_global_id(webhook_id)
-        return service_account.webhooks.filter(id=webhook_id).first()
+def resolve_webhook(info, id):
+    app = info.context.app
+    _, id = from_global_id_or_error(id, Webhook)
+    if app:
+        return app.webhooks.filter(id=id).first()
     user = info.context.user
-    if user.has_perm("webhook.manage_webhooks"):
-        return graphene.Node.get_node_from_global_id(info, webhook_id, Webhook)
-    raise PermissionDenied()
+    if user.has_perm(AppPermission.MANAGE_APPS):
+        return models.Webhook.objects.filter(pk=id).first()
+    raise PermissionDenied(permissions=[AppPermission.MANAGE_APPS])
 
 
 def resolve_webhook_events():
@@ -33,11 +38,15 @@ def resolve_webhook_events():
     ]
 
 
+@traced_resolver
 def resolve_sample_payload(info, event_name):
-    service_account = info.context.service_account
-    required_permission = WebhookEventType.PERMISSIONS.get(event_name)
-    if service_account and service_account.has_perm(required_permission):
-        return payloads.generate_sample_payload(event_name)
-    if info.context.user.has_perm(required_permission):
-        return payloads.generate_sample_payload(event_name)
-    raise PermissionDenied()
+    app = info.context.app
+    required_permission = WebhookEventAsyncType.PERMISSIONS.get(
+        event_name, WebhookEventSyncType.PERMISSIONS.get(event_name)
+    )
+    if required_permission:
+        if app and app.has_perm(required_permission):
+            return payloads.generate_sample_payload(event_name)
+        if info.context.user.has_perm(required_permission):
+            return payloads.generate_sample_payload(event_name)
+    raise PermissionDenied(permissions=[required_permission])

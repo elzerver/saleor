@@ -9,16 +9,23 @@ from django.db import connection
 from ....account.utils import create_superuser
 from ...utils.random_data import (
     add_address_to_admin,
-    create_gift_card,
+    create_channels,
+    create_checkout_with_custom_prices,
+    create_checkout_with_preorders,
+    create_gift_cards,
     create_menus,
     create_orders,
-    create_page,
+    create_page_type,
+    create_pages,
+    create_permission_groups,
+    create_preorder_orders,
     create_product_sales,
     create_products_by_schema,
     create_shipping_zones,
+    create_staffs,
     create_users,
     create_vouchers,
-    set_homepage_collection,
+    create_warehouses,
 )
 
 
@@ -34,6 +41,9 @@ class Command(BaseCommand):
             default=False,
             help="Create admin account",
         )
+        parser.add_argument("--user_password", type=str, default="password")
+        parser.add_argument("--staff_password", type=str, default="password")
+        parser.add_argument("--superuser_password", type=str, default="admin")
         parser.add_argument(
             "--withoutimages",
             action="store_true",
@@ -42,34 +52,12 @@ class Command(BaseCommand):
             help="Don't create product images",
         )
         parser.add_argument(
-            "--withoutsearch",
-            action="store_true",
-            dest="withoutsearch",
-            default=False,
-            help="Don't update search index",
-        )
-        parser.add_argument(
             "--skipsequencereset",
             action="store_true",
             dest="skipsequencereset",
             default=False,
             help="Don't reset SQL sequences that are out of sync.",
         )
-
-    def make_database_faster(self):
-        """Sacrifice some of the safeguards of sqlite3 for speed.
-
-        Users are not likely to run this command in a production environment.
-        They are even less likely to run it in production while using sqlite3.
-        """
-        if "sqlite3" in connection.settings_dict["ENGINE"]:
-            cursor = connection.cursor()
-            cursor.execute("PRAGMA temp_store = MEMORY;")
-            cursor.execute("PRAGMA synchronous = OFF;")
-
-    def populate_search_index(self):
-        if settings.ES_URL:
-            call_command("search_index", "--rebuild", force=True)
 
     def sequence_reset(self):
         """Run a SQL sequence reset on all saleor.* apps.
@@ -88,9 +76,26 @@ class Command(BaseCommand):
             cursor.execute(commands.getvalue())
 
     def handle(self, *args, **options):
-        self.make_database_faster()
+        # set only our custom plugin to not call external API when preparing
+        # example database
+        user_password = options["user_password"]
+        staff_password = options["staff_password"]
+        superuser_password = options["superuser_password"]
+        settings.PLUGINS = [
+            "saleor.payment.gateways.dummy.plugin.DummyGatewayPlugin",
+            "saleor.payment.gateways.dummy_credit_card.plugin."
+            "DummyCreditCardGatewayPlugin",
+        ]
         create_images = not options["withoutimages"]
+        for msg in create_channels():
+            self.stdout.write(msg)
         for msg in create_shipping_zones():
+            self.stdout.write(msg)
+        create_warehouses()
+        self.stdout.write("Created warehouses")
+        for msg in create_page_type():
+            self.stdout.write(msg)
+        for msg in create_pages():
             self.stdout.write(msg)
         create_products_by_schema(self.placeholders_dir, create_images)
         self.stdout.write("Created products")
@@ -98,25 +103,33 @@ class Command(BaseCommand):
             self.stdout.write(msg)
         for msg in create_vouchers():
             self.stdout.write(msg)
-        for msg in create_gift_card():
-            self.stdout.write(msg)
-        for msg in create_users(20):
+        for msg in create_users(user_password, 20):
             self.stdout.write(msg)
         for msg in create_orders(20):
             self.stdout.write(msg)
-        for msg in set_homepage_collection():
+        for msg in create_preorder_orders(1):
             self.stdout.write(msg)
-        for msg in create_page():
+        for msg in create_gift_cards():
             self.stdout.write(msg)
         for msg in create_menus():
             self.stdout.write(msg)
+        for msg in create_checkout_with_preorders():
+            self.stdout.write(msg)
+        for msg in create_checkout_with_custom_prices():
+            self.stdout.write(msg)
 
         if options["createsuperuser"]:
-            credentials = {"email": "admin@example.com", "password": "admin"}
+            credentials = {
+                "email": "admin@example.com",
+                "password": superuser_password,
+            }
             msg = create_superuser(credentials)
             self.stdout.write(msg)
             add_address_to_admin(credentials["email"])
-        if not options["withoutsearch"]:
-            self.populate_search_index()
         if not options["skipsequencereset"]:
             self.sequence_reset()
+
+        for msg in create_permission_groups(staff_password):
+            self.stdout.write(msg)
+        for msg in create_staffs(staff_password):
+            self.stdout.write(msg)

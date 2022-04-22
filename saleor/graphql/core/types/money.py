@@ -1,22 +1,19 @@
 import graphene
 from django_prices.templatetags import prices
 
-from ..enums import TaxRateType
+from ....core.prices import quantize_price
 
 
 class Money(graphene.ObjectType):
     currency = graphene.String(description="Currency code.", required=True)
     amount = graphene.Float(description="Amount of money.", required=True)
-    localized = graphene.String(
-        description="Money formatted according to the current locale.",
-        required=True,
-        deprecation_reason="DEPRECATED: Will be removed in Saleor 2.11. "
-        "Price formatting according to the current locale should be "
-        "handled by the frontend client.",
-    )
 
     class Meta:
         description = "Represents amount of money in specific currency."
+
+    @staticmethod
+    def resolve_amount(root, _info):
+        return quantize_price(root.amount, root.currency)
 
     @staticmethod
     def resolve_localized(root, _info):
@@ -60,7 +57,7 @@ class VAT(graphene.ObjectType):
     country_code = graphene.String(description="Country code.", required=True)
     standard_rate = graphene.Float(description="Standard VAT rate in percent.")
     reduced_rates = graphene.List(
-        lambda: ReducedRate,
+        graphene.NonNull(lambda: ReducedRate),
         description="Country's VAT rate exceptions for specific types of goods.",
         required=True,
     )
@@ -83,7 +80,7 @@ class VAT(graphene.ObjectType):
 
 class ReducedRate(graphene.ObjectType):
     rate = graphene.Float(description="Reduced VAT rate in percent.", required=True)
-    rate_type = TaxRateType(description="A type of goods.", required=True)
+    rate_type = graphene.String(description="A type of goods.", required=True)
 
     class Meta:
         description = "Represents a reduced VAT rate for a particular type of goods."

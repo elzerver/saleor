@@ -1,52 +1,56 @@
 import graphene
 
+from saleor.core.tracing import traced_resolver
+
+from ...core.permissions import ProductPermissions, has_one_of_permissions
+from ...product.models import ALL_PRODUCTS_PERMISSIONS
+from ..channel import ChannelContext
+from ..channel.utils import get_default_channel_slug_or_graphql_error
+from ..core.connection import create_connection_slice, filter_connection_queryset
 from ..core.enums import ReportingPeriod
-from ..core.fields import FilterInputConnectionField, PrefetchingConnectionField
+from ..core.fields import ConnectionField, FilterConnectionField
+from ..core.types import NonNullList
+from ..core.utils import from_global_id_or_error
+from ..core.validators import validate_one_of_args_is_in_query
 from ..decorators import permission_required
-from ..descriptions import DESCRIPTIONS
 from ..translations.mutations import (
-    AttributeTranslate,
-    AttributeValueTranslate,
     CategoryTranslate,
     CollectionTranslate,
     ProductTranslate,
     ProductVariantTranslate,
 )
-from .bulk_mutations.attributes import AttributeBulkDelete, AttributeValueBulkDelete
+from ..utils import get_user_or_app_from_context
 from .bulk_mutations.products import (
     CategoryBulkDelete,
     CollectionBulkDelete,
-    CollectionBulkPublish,
     ProductBulkDelete,
-    ProductBulkPublish,
-    ProductImageBulkDelete,
+    ProductMediaBulkDelete,
     ProductTypeBulkDelete,
     ProductVariantBulkCreate,
     ProductVariantBulkDelete,
+    ProductVariantStocksCreate,
+    ProductVariantStocksDelete,
+    ProductVariantStocksUpdate,
 )
-from .enums import StockAvailability
 from .filters import (
-    AttributeFilterInput,
     CategoryFilterInput,
     CollectionFilterInput,
     ProductFilterInput,
     ProductTypeFilterInput,
+    ProductVariantFilterInput,
 )
 from .mutations.attributes import (
-    AttributeAssign,
-    AttributeClearMeta,
-    AttributeClearPrivateMeta,
-    AttributeCreate,
-    AttributeDelete,
-    AttributeReorderValues,
-    AttributeUnassign,
-    AttributeUpdate,
-    AttributeUpdateMeta,
-    AttributeUpdatePrivateMeta,
-    AttributeValueCreate,
-    AttributeValueDelete,
-    AttributeValueUpdate,
+    ProductAttributeAssign,
+    ProductAttributeAssignmentUpdate,
+    ProductAttributeUnassign,
+    ProductReorderAttributeValues,
     ProductTypeReorderAttributes,
+    ProductVariantReorderAttributeValues,
+)
+from .mutations.channels import (
+    CollectionChannelListingUpdate,
+    ProductChannelListingUpdate,
+    ProductVariantChannelListingUpdate,
 )
 from .mutations.digital_contents import (
     DigitalContentCreate,
@@ -55,73 +59,74 @@ from .mutations.digital_contents import (
     DigitalContentUrlCreate,
 )
 from .mutations.products import (
-    CategoryClearMeta,
-    CategoryClearPrivateMeta,
     CategoryCreate,
     CategoryDelete,
     CategoryUpdate,
-    CategoryUpdateMeta,
-    CategoryUpdatePrivateMeta,
     CollectionAddProducts,
-    CollectionClearMeta,
-    CollectionClearPrivateMeta,
     CollectionCreate,
     CollectionDelete,
     CollectionRemoveProducts,
     CollectionReorderProducts,
     CollectionUpdate,
-    CollectionUpdateMeta,
-    CollectionUpdatePrivateMeta,
-    ProductClearMeta,
-    ProductClearPrivateMeta,
     ProductCreate,
     ProductDelete,
-    ProductImageCreate,
-    ProductImageDelete,
-    ProductImageReorder,
-    ProductImageUpdate,
-    ProductTypeClearMeta,
-    ProductTypeClearPrivateMeta,
+    ProductMediaCreate,
+    ProductMediaDelete,
+    ProductMediaReorder,
+    ProductMediaUpdate,
     ProductTypeCreate,
     ProductTypeDelete,
     ProductTypeUpdate,
-    ProductTypeUpdateMeta,
-    ProductTypeUpdatePrivateMeta,
     ProductUpdate,
-    ProductUpdateMeta,
-    ProductUpdatePrivateMeta,
-    ProductVariantClearMeta,
-    ProductVariantClearPrivateMeta,
     ProductVariantCreate,
     ProductVariantDelete,
+    ProductVariantPreorderDeactivate,
+    ProductVariantReorder,
+    ProductVariantSetDefault,
     ProductVariantUpdate,
-    ProductVariantUpdateMeta,
-    ProductVariantUpdatePrivateMeta,
-    VariantImageAssign,
-    VariantImageUnassign,
+    VariantMediaAssign,
+    VariantMediaUnassign,
 )
 from .resolvers import (
-    resolve_attributes,
     resolve_categories,
+    resolve_category_by_id,
+    resolve_category_by_slug,
+    resolve_collection_by_id,
+    resolve_collection_by_slug,
     resolve_collections,
+    resolve_digital_content_by_id,
     resolve_digital_contents,
+    resolve_product_by_id,
+    resolve_product_by_slug,
+    resolve_product_type_by_id,
     resolve_product_types,
+    resolve_product_variant_by_sku,
     resolve_product_variants,
     resolve_products,
     resolve_report_product_sales,
+    resolve_variant_by_id,
 )
-from .scalars import AttributeScalar
-from .types import (
-    Attribute,
-    Category,
-    Collection,
-    DigitalContent,
-    Product,
+from .sorters import (
+    CategorySortingInput,
+    CollectionSortingInput,
     ProductOrder,
-    ProductType,
-    ProductVariant,
+    ProductTypeSortingInput,
+    ProductVariantSortingInput,
 )
-from .types.attributes import AttributeSortingInput
+from .types import (
+    Category,
+    CategoryCountableConnection,
+    Collection,
+    CollectionCountableConnection,
+    DigitalContent,
+    DigitalContentCountableConnection,
+    Product,
+    ProductCountableConnection,
+    ProductType,
+    ProductTypeCountableConnection,
+    ProductVariant,
+    ProductVariantCountableConnection,
+)
 
 
 class ProductQueries(graphene.ObjectType):
@@ -132,45 +137,13 @@ class ProductQueries(graphene.ObjectType):
             graphene.ID, description="ID of the digital content.", required=True
         ),
     )
-    digital_contents = PrefetchingConnectionField(
-        DigitalContent, description="List of digital content."
+    digital_contents = ConnectionField(
+        DigitalContentCountableConnection, description="List of digital content."
     )
-    attributes = FilterInputConnectionField(
-        Attribute,
-        description="List of the shop's attributes.",
-        query=graphene.String(description=DESCRIPTIONS["attributes"]),
-        in_category=graphene.Argument(
-            graphene.ID,
-            description=(
-                "Return attributes for products belonging to the given category. "
-                "DEPRECATED: Will be removed in Saleor 2.10, use the `filter` field "
-                "instead."
-            ),
-        ),
-        in_collection=graphene.Argument(
-            graphene.ID,
-            description=(
-                "Return attributes for products belonging to the given collection. "
-                "DEPRECATED: Will be removed in Saleor 2.10, use the `filter` "
-                "field instead."
-            ),
-        ),
-        filter=AttributeFilterInput(description="Filtering options for attributes."),
-        sort_by=graphene.Argument(
-            AttributeSortingInput, description="Sorting options for attributes."
-        ),
-    )
-    attribute = graphene.Field(
-        Attribute,
-        id=graphene.Argument(
-            graphene.ID, description="ID of the attribute.", required=True
-        ),
-        description="Look up an attribute by ID.",
-    )
-    categories = FilterInputConnectionField(
-        Category,
-        query=graphene.String(description=DESCRIPTIONS["category"]),
+    categories = FilterConnectionField(
+        CategoryCountableConnection,
         filter=CategoryFilterInput(description="Filtering options for categories."),
+        sort_by=CategorySortingInput(description="Sort categories."),
         level=graphene.Argument(
             graphene.Int,
             description="Filter categories by the nesting level in the category tree.",
@@ -179,60 +152,50 @@ class ProductQueries(graphene.ObjectType):
     )
     category = graphene.Field(
         Category,
-        id=graphene.Argument(
-            graphene.ID, required=True, description="ID of the category."
-        ),
-        description="Look up a category by ID.",
+        id=graphene.Argument(graphene.ID, description="ID of the category."),
+        slug=graphene.Argument(graphene.String, description="Slug of the category"),
+        description="Look up a category by ID or slug.",
     )
     collection = graphene.Field(
         Collection,
         id=graphene.Argument(
-            graphene.ID, description="ID of the collection.", required=True
+            graphene.ID,
+            description="ID of the collection.",
+        ),
+        slug=graphene.Argument(graphene.String, description="Slug of the category"),
+        channel=graphene.String(
+            description="Slug of a channel for which the data should be returned."
         ),
         description="Look up a collection by ID.",
     )
-    collections = FilterInputConnectionField(
-        Collection,
+    collections = FilterConnectionField(
+        CollectionCountableConnection,
         filter=CollectionFilterInput(description="Filtering options for collections."),
-        query=graphene.String(description=DESCRIPTIONS["collection"]),
+        sort_by=CollectionSortingInput(description="Sort collections."),
         description="List of the shop's collections.",
+        channel=graphene.String(
+            description="Slug of a channel for which the data should be returned."
+        ),
     )
     product = graphene.Field(
         Product,
         id=graphene.Argument(
-            graphene.ID, description="ID of the product.", required=True
+            graphene.ID,
+            description="ID of the product.",
+        ),
+        slug=graphene.Argument(graphene.String, description="Slug of the product."),
+        channel=graphene.String(
+            description="Slug of a channel for which the data should be returned."
         ),
         description="Look up a product by ID.",
     )
-    products = FilterInputConnectionField(
-        Product,
+    products = FilterConnectionField(
+        ProductCountableConnection,
         filter=ProductFilterInput(description="Filtering options for products."),
-        attributes=graphene.List(
-            AttributeScalar,
-            description=(
-                "Filter products by attributes. DEPRECATED: Will be removed in "
-                "Saleor 2.10, use the `filter` field instead."
-            ),
+        sort_by=ProductOrder(description="Sort products."),
+        channel=graphene.String(
+            description="Slug of a channel for which the data should be returned."
         ),
-        categories=graphene.List(
-            graphene.ID,
-            description=(
-                "Filter products by category. DEPRECATED: Will be removed in "
-                "Saleor 2.10, use the `filter` field instead."
-            ),
-        ),
-        collections=graphene.List(
-            graphene.ID,
-            description=(
-                "Filter products by collections. DEPRECATED: Will be removed in "
-                "Saleor 2.10, use the `filter` field instead."
-            ),
-        ),
-        sort_by=graphene.Argument(ProductOrder, description="Sort products."),
-        stock_availability=graphene.Argument(
-            StockAvailability, description="Filter products by stock availability."
-        ),
-        query=graphene.String(description=DESCRIPTIONS["product"]),
         description="List of the shop's products.",
     )
     product_type = graphene.Field(
@@ -242,156 +205,266 @@ class ProductQueries(graphene.ObjectType):
         ),
         description="Look up a product type by ID.",
     )
-    product_types = FilterInputConnectionField(
-        ProductType,
+    product_types = FilterConnectionField(
+        ProductTypeCountableConnection,
         filter=ProductTypeFilterInput(
             description="Filtering options for product types."
         ),
-        query=graphene.String(description=DESCRIPTIONS["product_type"]),
+        sort_by=ProductTypeSortingInput(description="Sort product types."),
         description="List of the shop's product types.",
     )
     product_variant = graphene.Field(
         ProductVariant,
         id=graphene.Argument(
-            graphene.ID, description="ID of the product variant.", required=True
+            graphene.ID,
+            description="ID of the product variant.",
         ),
-        description="Look up a product variant by ID.",
+        sku=graphene.Argument(
+            graphene.String, description="Sku of the product variant."
+        ),
+        channel=graphene.String(
+            description="Slug of a channel for which the data should be returned."
+        ),
+        description="Look up a product variant by ID or SKU.",
     )
-    product_variants = PrefetchingConnectionField(
-        ProductVariant,
-        ids=graphene.List(
+    product_variants = FilterConnectionField(
+        ProductVariantCountableConnection,
+        ids=NonNullList(
             graphene.ID, description="Filter product variants by given IDs."
         ),
+        channel=graphene.String(
+            description="Slug of a channel for which the data should be returned."
+        ),
+        filter=ProductVariantFilterInput(
+            description="Filtering options for product variant."
+        ),
+        sort_by=ProductVariantSortingInput(description="Sort products variants."),
         description="List of product variants.",
     )
-    report_product_sales = PrefetchingConnectionField(
-        ProductVariant,
+    report_product_sales = ConnectionField(
+        ProductVariantCountableConnection,
         period=graphene.Argument(
             ReportingPeriod, required=True, description="Span of time."
+        ),
+        channel=graphene.String(
+            description="Slug of a channel for which the data should be returned.",
+            required=True,
         ),
         description="List of top selling products.",
     )
 
-    def resolve_attributes(self, info, **kwargs):
-        return resolve_attributes(info, **kwargs)
+    def resolve_categories(self, info, level=None, **kwargs):
+        qs = resolve_categories(info, level=level, **kwargs)
+        qs = filter_connection_queryset(qs, kwargs)
+        return create_connection_slice(qs, info, kwargs, CategoryCountableConnection)
 
-    def resolve_attribute(self, info, id):
-        return graphene.Node.get_node_from_global_id(info, id, Attribute)
+    @traced_resolver
+    def resolve_category(self, info, id=None, slug=None, **kwargs):
+        validate_one_of_args_is_in_query("id", id, "slug", slug)
+        if id:
+            _, id = from_global_id_or_error(id, Category)
+            return resolve_category_by_id(id)
+        if slug:
+            return resolve_category_by_slug(slug=slug)
 
-    def resolve_categories(self, info, level=None, query=None, **_kwargs):
-        return resolve_categories(info, level=level, query=query)
+    @traced_resolver
+    def resolve_collection(self, info, id=None, slug=None, channel=None, **_kwargs):
+        validate_one_of_args_is_in_query("id", id, "slug", slug)
+        requestor = get_user_or_app_from_context(info.context)
 
-    def resolve_category(self, info, id):
-        return graphene.Node.get_node_from_global_id(info, id, Category)
+        has_required_permissions = has_one_of_permissions(
+            requestor, ALL_PRODUCTS_PERMISSIONS
+        )
+        if channel is None and not has_required_permissions:
+            channel = get_default_channel_slug_or_graphql_error()
+        if id:
+            _, id = from_global_id_or_error(id, Collection)
+            collection = resolve_collection_by_id(info, id, channel, requestor)
+        else:
+            collection = resolve_collection_by_slug(
+                info, slug=slug, channel_slug=channel, requestor=requestor
+            )
+        return (
+            ChannelContext(node=collection, channel_slug=channel)
+            if collection
+            else None
+        )
 
-    def resolve_collection(self, info, id):
-        return graphene.Node.get_node_from_global_id(info, id, Collection)
+    def resolve_collections(self, info, channel=None, *_args, **kwargs):
+        requestor = get_user_or_app_from_context(info.context)
+        has_required_permissions = has_one_of_permissions(
+            requestor, ALL_PRODUCTS_PERMISSIONS
+        )
+        if channel is None and not has_required_permissions:
+            channel = get_default_channel_slug_or_graphql_error()
+        qs = resolve_collections(info, channel)
+        kwargs["channel"] = channel
+        qs = filter_connection_queryset(qs, kwargs)
+        return create_connection_slice(qs, info, kwargs, CollectionCountableConnection)
 
-    def resolve_collections(self, info, query=None, **_kwargs):
-        return resolve_collections(info, query)
-
-    @permission_required("product.manage_products")
+    @permission_required(ProductPermissions.MANAGE_PRODUCTS)
     def resolve_digital_content(self, info, id):
-        return graphene.Node.get_node_from_global_id(info, id, DigitalContent)
+        _, id = from_global_id_or_error(id, DigitalContent)
+        return resolve_digital_content_by_id(id)
 
-    @permission_required("product.manage_products")
-    def resolve_digital_contents(self, info, **_kwargs):
-        return resolve_digital_contents(info)
+    @permission_required(ProductPermissions.MANAGE_PRODUCTS)
+    def resolve_digital_contents(self, info, **kwargs):
+        qs = resolve_digital_contents(info)
+        return create_connection_slice(
+            qs, info, kwargs, DigitalContentCountableConnection
+        )
 
-    def resolve_product(self, info, id):
-        return graphene.Node.get_node_from_global_id(info, id, Product)
+    @traced_resolver
+    def resolve_product(self, info, id=None, slug=None, channel=None, **_kwargs):
+        validate_one_of_args_is_in_query("id", id, "slug", slug)
+        requestor = get_user_or_app_from_context(info.context)
 
-    def resolve_products(self, info, **kwargs):
-        return resolve_products(info, **kwargs)
+        has_required_permissions = has_one_of_permissions(
+            requestor, ALL_PRODUCTS_PERMISSIONS
+        )
 
-    def resolve_product_type(self, info, id):
-        return graphene.Node.get_node_from_global_id(info, id, ProductType)
+        if channel is None and not has_required_permissions:
+            channel = get_default_channel_slug_or_graphql_error()
+        if id:
+            _type, id = from_global_id_or_error(id, Product)
+            product = resolve_product_by_id(
+                info, id, channel_slug=channel, requestor=requestor
+            )
+        else:
+            product = resolve_product_by_slug(
+                info, product_slug=slug, channel_slug=channel, requestor=requestor
+            )
+        return ChannelContext(node=product, channel_slug=channel) if product else None
 
-    def resolve_product_types(self, info, query=None, **_kwargs):
-        return resolve_product_types(info, query)
+    @traced_resolver
+    def resolve_products(self, info, channel=None, **kwargs):
+        requestor = get_user_or_app_from_context(info.context)
+        has_required_permissions = has_one_of_permissions(
+            requestor, ALL_PRODUCTS_PERMISSIONS
+        )
+        if channel is None and not has_required_permissions:
+            channel = get_default_channel_slug_or_graphql_error()
+        qs = resolve_products(info, requestor, channel_slug=channel, **kwargs)
+        kwargs["channel"] = channel
+        qs = filter_connection_queryset(qs, kwargs)
+        return create_connection_slice(qs, info, kwargs, ProductCountableConnection)
 
-    def resolve_product_variant(self, info, id):
-        return graphene.Node.get_node_from_global_id(info, id, ProductVariant)
+    def resolve_product_type(self, info, id, **_kwargs):
+        _, id = from_global_id_or_error(id, ProductType)
+        return resolve_product_type_by_id(id)
 
-    def resolve_product_variants(self, info, ids=None, **_kwargs):
-        return resolve_product_variants(info, ids)
+    def resolve_product_types(self, info, **kwargs):
+        qs = resolve_product_types(info, **kwargs)
+        qs = filter_connection_queryset(qs, kwargs)
+        return create_connection_slice(qs, info, kwargs, ProductTypeCountableConnection)
 
-    @permission_required(["order.manage_orders", "product.manage_products"])
-    def resolve_report_product_sales(self, *_args, period, **_kwargs):
-        return resolve_report_product_sales(period)
+    @traced_resolver
+    def resolve_product_variant(
+        self,
+        info,
+        id=None,
+        sku=None,
+        channel=None,
+    ):
+        validate_one_of_args_is_in_query("id", id, "sku", sku)
+        requestor = get_user_or_app_from_context(info.context)
+        has_required_permissions = has_one_of_permissions(
+            requestor, ALL_PRODUCTS_PERMISSIONS
+        )
+
+        if channel is None and not has_required_permissions:
+            channel = get_default_channel_slug_or_graphql_error()
+        if id:
+            _, id = from_global_id_or_error(id, ProductVariant)
+            variant = resolve_variant_by_id(
+                info,
+                id,
+                channel_slug=channel,
+                requestor=requestor,
+                requestor_has_access_to_all=has_required_permissions,
+            )
+        else:
+            variant = resolve_product_variant_by_sku(
+                info,
+                sku=sku,
+                channel_slug=channel,
+                requestor=requestor,
+                requestor_has_access_to_all=has_required_permissions,
+            )
+        return ChannelContext(node=variant, channel_slug=channel) if variant else None
+
+    def resolve_product_variants(self, info, ids=None, channel=None, **kwargs):
+        requestor = get_user_or_app_from_context(info.context)
+        has_required_permissions = has_one_of_permissions(
+            requestor, ALL_PRODUCTS_PERMISSIONS
+        )
+        if channel is None and not has_required_permissions:
+            channel = get_default_channel_slug_or_graphql_error()
+        qs = resolve_product_variants(
+            info,
+            ids=ids,
+            channel_slug=channel,
+            requestor_has_access_to_all=has_required_permissions,
+            requestor=requestor,
+        )
+        kwargs["channel"] = qs.channel_slug
+        qs = filter_connection_queryset(qs, kwargs)
+        return create_connection_slice(
+            qs, info, kwargs, ProductVariantCountableConnection
+        )
+
+    @permission_required(ProductPermissions.MANAGE_PRODUCTS)
+    @traced_resolver
+    def resolve_report_product_sales(self, info, *_args, period, channel, **kwargs):
+        qs = resolve_report_product_sales(period, channel_slug=channel)
+        kwargs["channel"] = qs.channel_slug
+        return create_connection_slice(
+            qs, info, kwargs, ProductVariantCountableConnection
+        )
 
 
 class ProductMutations(graphene.ObjectType):
-    attribute_create = AttributeCreate.Field()
-    attribute_delete = AttributeDelete.Field()
-    attribute_bulk_delete = AttributeBulkDelete.Field()
-    attribute_assign = AttributeAssign.Field()
-    attribute_unassign = AttributeUnassign.Field()
-    attribute_update = AttributeUpdate.Field()
-    attribute_translate = AttributeTranslate.Field()
-    attribute_update_metadata = AttributeUpdateMeta.Field()
-    attribute_clear_metadata = AttributeClearMeta.Field()
-    attribute_update_private_metadata = AttributeUpdatePrivateMeta.Field()
-    attribute_clear_private_metadata = AttributeClearPrivateMeta.Field()
-
-    attribute_value_create = AttributeValueCreate.Field()
-    attribute_value_delete = AttributeValueDelete.Field()
-    attribute_value_bulk_delete = AttributeValueBulkDelete.Field()
-    attribute_value_update = AttributeValueUpdate.Field()
-    attribute_value_translate = AttributeValueTranslate.Field()
-    attribute_reorder_values = AttributeReorderValues.Field()
+    product_attribute_assign = ProductAttributeAssign.Field()
+    product_attribute_assignment_update = ProductAttributeAssignmentUpdate.Field()
+    product_attribute_unassign = ProductAttributeUnassign.Field()
 
     category_create = CategoryCreate.Field()
     category_delete = CategoryDelete.Field()
     category_bulk_delete = CategoryBulkDelete.Field()
     category_update = CategoryUpdate.Field()
     category_translate = CategoryTranslate.Field()
-    category_update_metadata = CategoryUpdateMeta.Field()
-    category_clear_metadata = CategoryClearMeta.Field()
-    category_update_private_metadata = CategoryUpdatePrivateMeta.Field()
-    category_clear_private_metadata = CategoryClearPrivateMeta.Field()
 
     collection_add_products = CollectionAddProducts.Field()
     collection_create = CollectionCreate.Field()
     collection_delete = CollectionDelete.Field()
     collection_reorder_products = CollectionReorderProducts.Field()
     collection_bulk_delete = CollectionBulkDelete.Field()
-    collection_bulk_publish = CollectionBulkPublish.Field()
     collection_remove_products = CollectionRemoveProducts.Field()
     collection_update = CollectionUpdate.Field()
     collection_translate = CollectionTranslate.Field()
-    collection_update_metadata = CollectionUpdateMeta.Field()
-    collection_clear_metadata = CollectionClearMeta.Field()
-    collection_update_private_metadata = CollectionUpdatePrivateMeta.Field()
-    collection_clear_private_metadata = CollectionClearPrivateMeta.Field()
+    collection_channel_listing_update = CollectionChannelListingUpdate.Field()
 
     product_create = ProductCreate.Field()
     product_delete = ProductDelete.Field()
     product_bulk_delete = ProductBulkDelete.Field()
-    product_bulk_publish = ProductBulkPublish.Field()
     product_update = ProductUpdate.Field()
     product_translate = ProductTranslate.Field()
-    product_update_metadata = ProductUpdateMeta.Field()
-    product_clear_metadata = ProductClearMeta.Field()
-    product_update_private_metadata = ProductUpdatePrivateMeta.Field()
-    product_clear_private_metadata = ProductClearPrivateMeta.Field()
 
-    product_image_create = ProductImageCreate.Field()
-    product_image_delete = ProductImageDelete.Field()
-    product_image_bulk_delete = ProductImageBulkDelete.Field()
-    product_image_reorder = ProductImageReorder.Field()
-    product_image_update = ProductImageUpdate.Field()
+    product_channel_listing_update = ProductChannelListingUpdate.Field()
+
+    product_media_create = ProductMediaCreate.Field()
+    product_variant_reorder = ProductVariantReorder.Field()
+    product_media_delete = ProductMediaDelete.Field()
+    product_media_bulk_delete = ProductMediaBulkDelete.Field()
+    product_media_reorder = ProductMediaReorder.Field()
+    product_media_update = ProductMediaUpdate.Field()
 
     product_type_create = ProductTypeCreate.Field()
     product_type_delete = ProductTypeDelete.Field()
     product_type_bulk_delete = ProductTypeBulkDelete.Field()
     product_type_update = ProductTypeUpdate.Field()
     product_type_reorder_attributes = ProductTypeReorderAttributes.Field()
-
-    product_type_update_metadata = ProductTypeUpdateMeta.Field()
-    product_type_clear_metadata = ProductTypeClearMeta.Field()
-    product_type_update_private_metadata = ProductTypeUpdatePrivateMeta.Field()
-    product_type_clear_private_metadata = ProductTypeClearPrivateMeta.Field()
+    product_reorder_attribute_values = ProductReorderAttributeValues.Field()
 
     digital_content_create = DigitalContentCreate.Field()
     digital_content_delete = DigitalContentDelete.Field()
@@ -403,12 +476,17 @@ class ProductMutations(graphene.ObjectType):
     product_variant_delete = ProductVariantDelete.Field()
     product_variant_bulk_create = ProductVariantBulkCreate.Field()
     product_variant_bulk_delete = ProductVariantBulkDelete.Field()
+    product_variant_stocks_create = ProductVariantStocksCreate.Field()
+    product_variant_stocks_delete = ProductVariantStocksDelete.Field()
+    product_variant_stocks_update = ProductVariantStocksUpdate.Field()
     product_variant_update = ProductVariantUpdate.Field()
+    product_variant_set_default = ProductVariantSetDefault.Field()
     product_variant_translate = ProductVariantTranslate.Field()
-    product_variant_update_metadata = ProductVariantUpdateMeta.Field()
-    product_variant_clear_metadata = ProductVariantClearMeta.Field()
-    product_variant_update_private_metadata = ProductVariantUpdatePrivateMeta.Field()
-    product_variant_clear_private_metadata = ProductVariantClearPrivateMeta.Field()
+    product_variant_channel_listing_update = ProductVariantChannelListingUpdate.Field()
+    product_variant_reorder_attribute_values = (
+        ProductVariantReorderAttributeValues.Field()
+    )
+    product_variant_preorder_deactivate = ProductVariantPreorderDeactivate.Field()
 
-    variant_image_assign = VariantImageAssign.Field()
-    variant_image_unassign = VariantImageUnassign.Field()
+    variant_media_assign = VariantMediaAssign.Field()
+    variant_media_unassign = VariantMediaUnassign.Field()

@@ -1,9 +1,12 @@
 import datetime
+from typing import Any
 
-from django.contrib.postgres.fields import JSONField
-from django.db import models
+from django.contrib.postgres.indexes import GinIndex
+from django.db import models, transaction
+from django.db.models import JSONField  # type: ignore
 from django.db.models import F, Max, Q
 
+from . import EventDeliveryStatus, JobStatus
 from .utils.json_serializer import CustomJsonEncoder
 
 
@@ -28,6 +31,7 @@ class SortableModel(models.Model):
             self.sort_order = 0 if existing_max is None else existing_max + 1
         super().save(*args, **kwargs)
 
+    @transaction.atomic
     def delete(self, *args, **kwargs):
         if self.sort_order is not None:
             qs = self.get_ordering_queryset()
@@ -45,21 +49,12 @@ class PublishedQuerySet(models.QuerySet):
             is_published=True,
         )
 
-    @staticmethod
-    def user_has_access_to_all(user):
-        return user.is_active and user.has_perm("product.manage_products")
-
-    def visible_to_user(self, user):
-        if self.user_has_access_to_all(user):
-            return self.all()
-        return self.published()
-
 
 class PublishableModel(models.Model):
     publication_date = models.DateField(blank=True, null=True)
     is_published = models.BooleanField(default=False)
 
-    objects = PublishedQuerySet.as_manager()
+    objects = models.Manager.from_queryset(PublishedQuerySet)()
 
     class Meta:
         abstract = True
@@ -68,37 +63,104 @@ class PublishableModel(models.Model):
     def is_visible(self):
         return self.is_published and (
             self.publication_date is None
-            or self.publication_date < datetime.date.today()
+            or self.publication_date <= datetime.date.today()
         )
 
 
 class ModelWithMetadata(models.Model):
-    private_meta = JSONField(
+    private_metadata = JSONField(
         blank=True, null=True, default=dict, encoder=CustomJsonEncoder
     )
-    meta = JSONField(blank=True, null=True, default=dict, encoder=CustomJsonEncoder)
+    metadata = JSONField(blank=True, null=True, default=dict, encoder=CustomJsonEncoder)
+
+    class Meta:
+        indexes = [
+            GinIndex(fields=["private_metadata"], name="%(class)s_p_meta_idx"),
+            GinIndex(fields=["metadata"], name="%(class)s_meta_idx"),
+        ]
+        abstract = True
+
+    def get_value_from_private_metadata(self, key: str, default: Any = None) -> Any:
+        return self.private_metadata.get(key, default)
+
+    def store_value_in_private_metadata(self, items: dict):
+        if not self.private_metadata:
+            self.private_metadata = {}
+        self.private_metadata.update(items)
+
+    def clear_private_metadata(self):
+        self.private_metadata = {}
+
+    def delete_value_from_private_metadata(self, key: str):
+        if key in self.private_metadata:
+            del self.private_metadata[key]
+
+    def get_value_from_metadata(self, key: str, default: Any = None) -> Any:
+        return self.metadata.get(key, default)
+
+    def store_value_in_metadata(self, items: dict):
+        if not self.metadata:
+            self.metadata = {}
+        self.metadata.update(items)
+
+    def clear_metadata(self):
+        self.metadata = {}
+
+    def delete_value_from_metadata(self, key: str):
+        if key in self.metadata:
+            del self.metadata[key]
+
+
+class Job(models.Model):
+    status = models.CharField(
+        max_length=50, choices=JobStatus.CHOICES, default=JobStatus.PENDING
+    )
+    message = models.CharField(max_length=255, blank=True, null=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
 
     class Meta:
         abstract = True
 
-    def get_private_meta(self, namespace: str, client: str) -> dict:
-        return self.private_meta.get(namespace, {}).get(client, {})
 
-    def store_private_meta(self, namespace: str, client: str, item: dict):
-        if namespace not in self.private_meta:
-            self.private_meta[namespace] = {}
-        self.private_meta[namespace][str(client)] = item
+class EventPayload(models.Model):
+    payload = models.TextField()
+    created_at = models.DateTimeField(auto_now_add=True)
 
-    def clear_stored_private_meta_for_client(self, namespace: str, client: str):
-        self.private_meta.get(namespace, {}).pop(client, None)
 
-    def get_meta(self, namespace: str, client: str) -> dict:
-        return self.meta.get(namespace, {}).get(client, {})
+class EventDelivery(models.Model):
+    created_at = models.DateTimeField(auto_now_add=True)
+    status = models.CharField(
+        max_length=255,
+        choices=EventDeliveryStatus.CHOICES,
+        default=EventDeliveryStatus.PENDING,
+    )
+    event_type = models.CharField(max_length=255)
+    payload = models.ForeignKey(
+        EventPayload, related_name="deliveries", null=True, on_delete=models.CASCADE
+    )
+    webhook = models.ForeignKey("webhook.Webhook", on_delete=models.CASCADE)
 
-    def store_meta(self, namespace: str, client: str, item: dict):
-        if namespace not in self.meta:
-            self.meta[namespace] = {}
-        self.meta[namespace][str(client)] = item
+    class Meta:
+        ordering = ("-created_at",)
 
-    def clear_stored_meta_for_client(self, namespace: str, client: str):
-        self.meta.get(namespace, {}).pop(client, None)
+
+class EventDeliveryAttempt(models.Model):
+    delivery = models.ForeignKey(
+        EventDelivery, related_name="attempts", null=True, on_delete=models.CASCADE
+    )
+    created_at = models.DateTimeField(auto_now_add=True)
+    task_id = models.CharField(max_length=255, null=True)
+    duration = models.FloatField(null=True)
+    response = models.TextField(null=True)
+    response_headers = models.TextField(null=True)
+    response_status_code = models.PositiveSmallIntegerField(null=True)
+    request_headers = models.TextField(null=True)
+    status = models.CharField(
+        max_length=255,
+        choices=EventDeliveryStatus.CHOICES,
+        default=EventDeliveryStatus.PENDING,
+    )
+
+    class Meta:
+        ordering = ("-created_at",)

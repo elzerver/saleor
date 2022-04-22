@@ -1,28 +1,36 @@
-from django.conf import settings
-from django.core.checks import Warning, register
-
-TOKEN_PATTERN = (
-    "(?P<token>[0-9a-z]{8}-[0-9a-z]{4}-[0-9a-z]{4}-[0-9a-z]{4}" "-[0-9a-z]{12})"
-)
+default_app_config = "saleor.core.app.CoreAppConfig"
 
 
-@register()
-def check_session_caching(app_configs, **kwargs):  # pragma: no cover
-    errors = []
-    cached_engines = {
-        "django.contrib.sessions.backends.cache",
-        "django.contrib.sessions.backends.cached_db",
-    }
-    if (
-        "locmem" in settings.CACHES["default"]["BACKEND"]
-        and settings.SESSION_ENGINE in cached_engines
-    ):
-        errors.append(
-            Warning(
-                "Session caching cannot work with locmem backend",
-                "User sessions need to be globally shared, use a cache server"
-                " like Redis.",
-                "saleor.W001",
-            )
-        )
-    return errors
+class JobStatus:
+    PENDING = "pending"
+    SUCCESS = "success"
+    FAILED = "failed"
+    DELETED = "deleted"
+
+    CHOICES = [
+        (PENDING, "Pending"),
+        (SUCCESS, "Success"),
+        (FAILED, "Failed"),
+        (DELETED, "Deleted"),
+    ]
+
+
+class TimePeriodType:
+    DAY = "day"
+    WEEK = "week"
+    MONTH = "month"
+    YEAR = "year"
+
+    CHOICES = [(DAY, "Day"), (WEEK, "Week"), (MONTH, "Month"), (YEAR, "Year")]
+
+
+class EventDeliveryStatus:
+    PENDING = "pending"
+    SUCCESS = "success"
+    FAILED = "failed"
+
+    CHOICES = [
+        (PENDING, "Pending"),
+        (SUCCESS, "Success"),
+        (FAILED, "Failed"),
+    ]

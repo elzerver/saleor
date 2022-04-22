@@ -1,10 +1,20 @@
 import graphene
 
-from ..core.fields import PrefetchingConnectionField
+from ...core.permissions import OrderPermissions
+from ..core.connection import create_connection_slice, filter_connection_queryset
+from ..core.fields import FilterConnectionField
+from ..core.utils import from_global_id_or_error
 from ..decorators import permission_required
-from .mutations import PaymentCapture, PaymentRefund, PaymentSecureConfirm, PaymentVoid
-from .resolvers import resolve_client_token, resolve_payments
-from .types import Payment
+from .filters import PaymentFilterInput
+from .mutations import (
+    PaymentCapture,
+    PaymentCheckBalance,
+    PaymentInitialize,
+    PaymentRefund,
+    PaymentVoid,
+)
+from .resolvers import resolve_payment_by_id, resolve_payments
+from .types import Payment, PaymentCountableConnection
 
 
 class PaymentQueries(graphene.ObjectType):
@@ -15,30 +25,27 @@ class PaymentQueries(graphene.ObjectType):
             graphene.ID, description="ID of the payment.", required=True
         ),
     )
-    payments = PrefetchingConnectionField(Payment, description="List of payments.")
-    payment_client_token = graphene.Field(
-        graphene.String,
-        gateway=graphene.String(required=True, description="A payment gateway."),
-        deprecation_reason=(
-            "DEPRECATED: Will be removed in Saleor 2.10, "
-            "use payment gateway config instead in availablePaymentGateways."
-        ),
+    payments = FilterConnectionField(
+        PaymentCountableConnection,
+        filter=PaymentFilterInput(description="Filtering options for payments."),
+        description="List of payments.",
     )
 
-    @permission_required("order.manage_orders")
+    @permission_required(OrderPermissions.MANAGE_ORDERS)
     def resolve_payment(self, info, **data):
-        return graphene.Node.get_node_from_global_id(info, data.get("id"), Payment)
+        _, id = from_global_id_or_error(data["id"], Payment)
+        return resolve_payment_by_id(id)
 
-    @permission_required("order.manage_orders")
-    def resolve_payments(self, info, query=None, **_kwargs):
-        return resolve_payments(info, query)
-
-    def resolve_payment_client_token(self, info, gateway, **_kwargs):
-        return resolve_client_token(info.context.user, gateway)
+    @permission_required(OrderPermissions.MANAGE_ORDERS)
+    def resolve_payments(self, info, **kwargs):
+        qs = resolve_payments(info)
+        qs = filter_connection_queryset(qs, kwargs)
+        return create_connection_slice(qs, info, kwargs, PaymentCountableConnection)
 
 
 class PaymentMutations(graphene.ObjectType):
     payment_capture = PaymentCapture.Field()
     payment_refund = PaymentRefund.Field()
     payment_void = PaymentVoid.Field()
-    payment_secure_confirm = PaymentSecureConfirm.Field()
+    payment_initialize = PaymentInitialize.Field()
+    payment_check_balance = PaymentCheckBalance.Field()

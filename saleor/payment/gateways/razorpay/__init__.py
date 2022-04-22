@@ -3,13 +3,14 @@ import uuid
 from decimal import Decimal
 from typing import Dict
 
+import opentracing
+import opentracing.tags
 import razorpay
 import razorpay.errors
 
 from ... import TransactionKind
 from ...interface import GatewayConfig, GatewayResponse, PaymentData
 from . import errors
-from .forms import RazorPaymentForm
 from .utils import get_amount_for_razorpay, get_error_response
 
 # The list of currencies supported by razorpay
@@ -66,18 +67,9 @@ def clean_razorpay_response(response: Dict):
     """Convert the Razorpay response to our internal representation for easier processing.
 
     As the Razorpay response payload contains the final amount
-    in Indian rupees, we convert the amount to paisa (by dividing by 100).
+    in paisa, we convert the amount to Indian Rupees (by dividing by 100).
     """
     response["amount"] = Decimal(response["amount"]) / 100
-
-
-def create_form(data, payment_information, connection_params):
-    """Return the associated razorpay payment form."""
-    return RazorPaymentForm(
-        data=data,
-        payment_information=payment_information,
-        connection_params=connection_params,
-    )
 
 
 def get_client(public_key: str, private_key: str, **_):
@@ -106,9 +98,15 @@ def capture(payment_information: PaymentData, config: GatewayConfig) -> GatewayR
 
     if not error:
         try:
-            response = razorpay_client.payment.capture(
-                payment_information.token, razorpay_amount
-            )
+            with opentracing.global_tracer().start_active_span(
+                "razorpay.payment.capture"
+            ) as scope:
+                span = scope.span
+                span.set_tag(opentracing.tags.COMPONENT, "payment")
+                span.set_tag("service.name", "razorpay")
+                response = razorpay_client.payment.capture(
+                    payment_information.token, razorpay_amount
+                )
             clean_razorpay_response(response)
         except RAZORPAY_EXCEPTIONS as exc:
             error = get_error_message_from_razorpay_error(exc)
@@ -146,9 +144,15 @@ def refund(payment_information: PaymentData, config: GatewayConfig) -> GatewayRe
         razorpay_client = get_client(**config.connection_params)
         razorpay_amount = get_amount_for_razorpay(payment_information.amount)
         try:
-            response = razorpay_client.payment.refund(
-                payment_information.token, razorpay_amount
-            )
+            with opentracing.global_tracer().start_active_span(
+                "razorpay.payment.refund"
+            ) as scope:
+                span = scope.span
+                span.set_tag(opentracing.tags.COMPONENT, "payment")
+                span.set_tag("service.name", "razorpay")
+                response = razorpay_client.payment.refund(
+                    payment_information.token, razorpay_amount
+                )
             clean_razorpay_response(response)
         except RAZORPAY_EXCEPTIONS as exc:
             error = get_error_message_from_razorpay_error(exc)

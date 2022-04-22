@@ -33,7 +33,7 @@ def digital_content_url_is_valid(content_url: DigitalContentUrl) -> bool:
 
     if url_valid_days is not None:
         valid_days = timedelta(days=url_valid_days)
-        valid_until = content_url.created + valid_days
+        valid_until = content_url.created_at + valid_days
         if now() > valid_until:
             return False
 
@@ -49,7 +49,7 @@ def increment_download_count(content_url: DigitalContentUrl):
     line = content_url.line
     user = line.order.user if line else None
 
-    if user is not None:
+    if user and line:
         account_events.customer_downloaded_a_digital_link_event(
             user=user, order_line=line
         )

@@ -1,25 +1,28 @@
 from django.db import models
-from django.utils.translation import pgettext_lazy
 
-from ..account.models import ServiceAccount
+from ..app.models import App
+from ..app.validators import AppURLValidator
+
+
+class WebhookURLField(models.URLField):
+    default_validators = [
+        AppURLValidator(schemes=["http", "https", "awssqs", "gcpubsub"])
+    ]
 
 
 class Webhook(models.Model):
     name = models.CharField(max_length=255, null=True, blank=True)
-    service_account = models.ForeignKey(
-        ServiceAccount, related_name="webhooks", on_delete=models.CASCADE
-    )
-    target_url = models.URLField(max_length=255)
+    app = models.ForeignKey(App, related_name="webhooks", on_delete=models.CASCADE)
+    target_url = WebhookURLField(max_length=255)
     is_active = models.BooleanField(default=True)
     secret_key = models.CharField(max_length=255, null=True, blank=True)
+    subscription_query = models.TextField(null=True, blank=True)
 
     class Meta:
-        permissions = (
-            (
-                "manage_webhooks",
-                pgettext_lazy("Webhook description", "Manage webhooks"),
-            ),
-        )
+        ordering = ("pk",)
+
+    def __str__(self):
+        return self.name
 
 
 class WebhookEvent(models.Model):

@@ -1,23 +1,24 @@
-from collections import defaultdict
 from dataclasses import dataclass
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Type
 
 import graphene
 from django.core.exceptions import ValidationError
-from django.db import transaction
-from django.db.models import Model, QuerySet
+from django.db.models import Model
 
+from ...core.permissions import MenuPermissions, SitePermissions
+from ...core.tracing import traced_atomic_transaction
 from ...menu import models
 from ...menu.error_codes import MenuErrorCode
-from ...menu.utils import update_menu
 from ...page import models as page_models
 from ...product import models as product_models
+from ..channel import ChannelContext
 from ..core.mutations import BaseMutation, ModelDeleteMutation, ModelMutation
-from ..core.types.common import MenuError
-from ..core.utils import from_global_id_strict_type
+from ..core.types import MenuError, NonNullList
+from ..core.utils import validate_slug_and_generate_if_needed
 from ..core.utils.reordering import perform_reordering
 from ..page.types import Page
 from ..product.types import Category, Collection
+from .dataloaders import MenuItemsByParentMenuLoader
 from .enums import NavigationType
 from .types import Menu, MenuItem, MenuItemMoveInput
 
@@ -45,13 +46,13 @@ class MenuItemCreateInput(MenuItemInput):
     )
 
 
-class MenuInput(graphene.InputObjectType):
-    name = graphene.String(description="Name of the menu.")
-
-
 class MenuCreateInput(graphene.InputObjectType):
     name = graphene.String(description="Name of the menu.", required=True)
-    items = graphene.List(MenuItemInput, description="List of menu items.")
+    slug = graphene.String(
+        description="Slug of the menu. Will be generated if not provided.",
+        required=False,
+    )
+    items = NonNullList(MenuItemInput, description="List of menu items.")
 
 
 class MenuCreate(ModelMutation):
@@ -63,13 +64,22 @@ class MenuCreate(ModelMutation):
     class Meta:
         description = "Creates a new Menu."
         model = models.Menu
-        permissions = ("menu.manage_menus",)
+        object_type = Menu
+        permissions = (MenuPermissions.MANAGE_MENUS,)
         error_type_class = MenuError
         error_type_field = "menu_errors"
 
     @classmethod
     def clean_input(cls, info, instance, data):
         cleaned_input = super().clean_input(info, instance, data)
+        try:
+            cleaned_input = validate_slug_and_generate_if_needed(
+                instance, "name", cleaned_input
+            )
+        except ValidationError as error:
+            error.code = MenuErrorCode.REQUIRED.value
+            raise ValidationError({"slug": error})
+
         items = []
         for item in cleaned_input.get("items", []):
             category = item.get("category")
@@ -109,7 +119,6 @@ class MenuCreate(ModelMutation):
                     }
                 )
             items.append(item)
-
         cleaned_input["items"] = items
         return cleaned_input
 
@@ -119,6 +128,16 @@ class MenuCreate(ModelMutation):
         items = cleaned_data.get("items", [])
         for item in items:
             instance.items.create(**item)
+
+    @classmethod
+    def success_response(cls, instance):
+        instance = ChannelContext(node=instance, channel_slug=None)
+        return super().success_response(instance)
+
+
+class MenuInput(graphene.InputObjectType):
+    name = graphene.String(description="Name of the menu.")
+    slug = graphene.String(description="Slug of the menu.", required=False)
 
 
 class MenuUpdate(ModelMutation):
@@ -131,9 +150,15 @@ class MenuUpdate(ModelMutation):
     class Meta:
         description = "Updates a menu."
         model = models.Menu
-        permissions = ("menu.manage_menus",)
+        object_type = Menu
+        permissions = (MenuPermissions.MANAGE_MENUS,)
         error_type_class = MenuError
         error_type_field = "menu_errors"
+
+    @classmethod
+    def success_response(cls, instance):
+        instance = ChannelContext(node=instance, channel_slug=None)
+        return super().success_response(instance)
 
 
 class MenuDelete(ModelDeleteMutation):
@@ -143,24 +168,34 @@ class MenuDelete(ModelDeleteMutation):
     class Meta:
         description = "Deletes a menu."
         model = models.Menu
-        permissions = ("menu.manage_menus",)
+        object_type = Menu
+        permissions = (MenuPermissions.MANAGE_MENUS,)
         error_type_class = MenuError
         error_type_field = "menu_errors"
 
+    @classmethod
+    def success_response(cls, instance):
+        instance = ChannelContext(node=instance, channel_slug=None)
+        return super().success_response(instance)
+
 
 def _validate_menu_item_instance(
-    cleaned_input: dict, field: str, expected_model: Model
+    cleaned_input: dict, field: str, expected_model: Type[Model]
 ):
     """Check if the value to assign as a menu item matches the expected model."""
     item = cleaned_input.get(field)
-    if item is not None:
+    if item:
         if not isinstance(item, expected_model):
             msg = (
                 f"Enter a valid {expected_model._meta.verbose_name} ID "
                 f"(got {item._meta.verbose_name} ID)."
             )
             raise ValidationError(
-                {field: ValidationError(msg, code=MenuErrorCode.INVALID_MENU_ITEM)}
+                {
+                    field: ValidationError(
+                        msg, code=MenuErrorCode.INVALID_MENU_ITEM.value
+                    )
+                }
             )
 
 
@@ -177,9 +212,15 @@ class MenuItemCreate(ModelMutation):
     class Meta:
         description = "Creates a new menu item."
         model = models.MenuItem
-        permissions = ("menu.manage_menus",)
+        object_type = MenuItem
+        permissions = (MenuPermissions.MANAGE_MENUS,)
         error_type_class = MenuError
         error_type_field = "menu_errors"
+
+    @classmethod
+    def success_response(cls, instance):
+        instance = ChannelContext(node=instance, channel_slug=None)
+        return super().success_response(instance)
 
     @classmethod
     def clean_input(cls, info, instance, data):
@@ -204,11 +245,6 @@ class MenuItemCreate(ModelMutation):
             )
         return cleaned_input
 
-    @classmethod
-    def save(cls, info, instance, cleaned_input):
-        instance.save()
-        update_menu(instance.menu)
-
 
 class MenuItemUpdate(MenuItemCreate):
     class Arguments:
@@ -224,7 +260,8 @@ class MenuItemUpdate(MenuItemCreate):
     class Meta:
         description = "Updates a menu item."
         model = models.MenuItem
-        permissions = ("menu.manage_menus",)
+        object_type = MenuItem
+        permissions = (MenuPermissions.MANAGE_MENUS,)
         error_type_class = MenuError
         error_type_field = "menu_errors"
 
@@ -245,15 +282,15 @@ class MenuItemDelete(ModelDeleteMutation):
     class Meta:
         description = "Deletes a menu item."
         model = models.MenuItem
-        permissions = ("menu.manage_menus",)
+        object_type = MenuItem
+        permissions = (MenuPermissions.MANAGE_MENUS,)
         error_type_class = MenuError
         error_type_field = "menu_errors"
 
     @classmethod
-    def perform_mutation(cls, _root, info, **data):
-        response = super().perform_mutation(_root, info, **data)
-        update_menu(response.menuItem.menu)
-        return response
+    def success_response(cls, instance):
+        instance = ChannelContext(node=instance, channel_slug=None)
+        return super().success_response(instance)
 
 
 @dataclass(frozen=True)
@@ -269,15 +306,20 @@ class MenuItemMove(BaseMutation):
 
     class Arguments:
         menu = graphene.ID(required=True, description="ID of the menu.")
-        moves = graphene.List(
+        moves = NonNullList(
             MenuItemMoveInput, required=True, description="The menu position data."
         )
 
     class Meta:
         description = "Moves items of menus."
-        permissions = ("menu.manage_menus",)
+        permissions = (MenuPermissions.MANAGE_MENUS,)
         error_type_class = MenuError
         error_type_field = "menu_errors"
+
+    @classmethod
+    def success_response(cls, instance):
+        instance = ChannelContext(node=instance, channel_slug=None)
+        return super().success_response(instance)
 
     @staticmethod
     def clean_move(move: MenuItemMoveInput):
@@ -288,7 +330,7 @@ class MenuItemMove(BaseMutation):
                     {
                         "parent_id": ValidationError(
                             "Cannot assign a node to itself.",
-                            code=MenuErrorCode.CANNOT_ASSIGN_NODE,
+                            code=MenuErrorCode.CANNOT_ASSIGN_NODE.value,
                         )
                     }
                 )
@@ -306,25 +348,37 @@ class MenuItemMove(BaseMutation):
                                 "Cannot assign a node as child of "
                                 "one of its descendants."
                             ),
-                            code=MenuErrorCode.CANNOT_ASSIGN_NODE,
+                            code=MenuErrorCode.CANNOT_ASSIGN_NODE.value,
                         )
                     }
                 )
 
     @classmethod
     def get_operation(
-        cls, info, menu: models.Menu, move: MenuItemMoveInput
+        cls,
+        info,
+        menu_item_to_current_parent,
+        menu: models.Menu,
+        move: MenuItemMoveInput,
     ) -> _MenuMoveOperation:
         menu_item = cls.get_node_or_error(
             info, move.item_id, field="item", only_type="MenuItem", qs=menu.items
         )
         new_parent, parent_changed = None, False
 
+        # we want to check if parent has changes in relation to previous operations
+        # as moves are performed sequentially
+        old_parent_id = (
+            menu_item_to_current_parent[menu_item.pk]
+            if menu_item.pk in menu_item_to_current_parent
+            else menu_item.parent_id
+        )
+
         if move.parent_id is not None:
-            parent_pk = from_global_id_strict_type(
+            parent_pk = cls.get_global_id_or_error(
                 move.parent_id, only_type=MenuItem, field="parent_id"
             )
-            if int(parent_pk) != menu_item.parent_id:
+            if int(parent_pk) != old_parent_id:
                 new_parent = cls.get_node_or_error(
                     info,
                     move.parent_id,
@@ -333,7 +387,7 @@ class MenuItemMove(BaseMutation):
                     qs=menu.items,
                 )
                 parent_changed = True
-        elif move.parent_id is None and menu_item.parent_id is not None:
+        elif move.parent_id is None and old_parent_id is not None:
             parent_changed = True
 
         return _MenuMoveOperation(
@@ -347,52 +401,61 @@ class MenuItemMove(BaseMutation):
     def clean_moves(
         cls, info, menu: models.Menu, move_operations: List[MenuItemMoveInput]
     ) -> List[_MenuMoveOperation]:
-
         operations = []
+        item_to_current_parent: Dict[int, Optional[models.MenuItem]] = {}
         for move in move_operations:
             cls.clean_move(move)
-            operation = cls.get_operation(info, menu, move)
-            cls.clean_operation(operation)
+            operation = cls.get_operation(info, item_to_current_parent, menu, move)
+            if operation.parent_changed:
+                cls.clean_operation(operation)
+                item_to_current_parent[operation.menu_item.id] = operation.new_parent
             operations.append(operation)
         return operations
 
     @staticmethod
     def perform_change_parent_operation(operation: _MenuMoveOperation):
-        menu_item = operation.menu_item  # type: models.MenuItem
+        menu_item = operation.menu_item
 
         if not operation.parent_changed:
             return
 
+        # we need to refresh item, as it might be changes in previous operations
+        # and in such case the parent and level values are invalid
+        menu_item.refresh_from_db()
+
+        # parent cache need to be update in case of the item parent is changed
+        # more than once
+        menu_item._mptt_meta.update_mptt_cached_fields(menu_item)
+
         # Move the parent
-        menu_item.move_to(operation.new_parent)
+        menu_item.parent = operation.new_parent
         menu_item.sort_order = None
         menu_item.save()
 
     @classmethod
-    @transaction.atomic
-    def perform_mutation(cls, _root, info, menu: str, moves):
+    @traced_atomic_transaction()
+    def perform_mutation(cls, _root, info, **data):
+        menu: str = data["menu"]
+        moves: List[MenuItemMoveInput] = data["moves"]
         qs = models.Menu.objects.prefetch_related("items")
         menu = cls.get_node_or_error(info, menu, only_type=Menu, field="menu", qs=qs)
 
         operations = cls.clean_moves(info, menu, moves)
-        sort_operations: Dict[Optional[int], Dict[int, int]] = defaultdict(dict)
-        sort_querysets: Dict[Optional[int], QuerySet] = {}
 
         for operation in operations:
             cls.perform_change_parent_operation(operation)
 
             menu_item = operation.menu_item
-            parent_pk = operation.menu_item.parent_id
 
-            sort_operations[parent_pk][menu_item.pk] = operation.sort_order
-            sort_querysets[parent_pk] = menu_item.get_ordering_queryset()
-
-        for parent_pk, operations in sort_operations.items():
-            ordering_qs = sort_querysets[parent_pk]
-            perform_reordering(ordering_qs, operations)
+            if operation.sort_order:
+                perform_reordering(
+                    menu_item.get_ordering_queryset(),
+                    {menu_item.pk: operation.sort_order},
+                )
 
         menu = qs.get(pk=menu.pk)
-        return MenuItemMove(menu=menu)
+        MenuItemsByParentMenuLoader(info.context).clear(menu.id)
+        return MenuItemMove(menu=ChannelContext(node=menu, channel_slug=None))
 
 
 class AssignNavigation(BaseMutation):
@@ -407,7 +470,7 @@ class AssignNavigation(BaseMutation):
 
     class Meta:
         description = "Assigns storefront's navigation menus."
-        permissions = ("menu.manage_menus", "site.manage_settings")
+        permissions = (MenuPermissions.MANAGE_MENUS, SitePermissions.MANAGE_SETTINGS)
         error_type_class = MenuError
         error_type_field = "menu_errors"
 
@@ -424,4 +487,6 @@ class AssignNavigation(BaseMutation):
             site_settings.bottom_menu = menu
             site_settings.save(update_fields=["bottom_menu"])
 
-        return AssignNavigation(menu=menu)
+        if menu is None:
+            return AssignNavigation(menu=None)
+        return AssignNavigation(menu=ChannelContext(node=menu, channel_slug=None))

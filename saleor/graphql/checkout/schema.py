@@ -1,62 +1,78 @@
 import graphene
 
-from ..core.fields import BaseDjangoConnectionField, PrefetchingConnectionField
+from ...core.permissions import CheckoutPermissions
+from ..core.connection import create_connection_slice, filter_connection_queryset
+from ..core.descriptions import ADDED_IN_31, DEPRECATED_IN_3X_FIELD
+from ..core.fields import ConnectionField, FilterConnectionField
+from ..core.scalars import UUID
 from ..decorators import permission_required
 from ..payment.mutations import CheckoutPaymentCreate
+from .filters import CheckoutFilterInput
 from .mutations import (
     CheckoutAddPromoCode,
     CheckoutBillingAddressUpdate,
-    CheckoutClearMeta,
-    CheckoutClearPrivateMeta,
     CheckoutComplete,
     CheckoutCreate,
     CheckoutCustomerAttach,
     CheckoutCustomerDetach,
+    CheckoutDeliveryMethodUpdate,
     CheckoutEmailUpdate,
+    CheckoutLanguageCodeUpdate,
     CheckoutLineDelete,
     CheckoutLinesAdd,
+    CheckoutLinesDelete,
     CheckoutLinesUpdate,
     CheckoutRemovePromoCode,
     CheckoutShippingAddressUpdate,
     CheckoutShippingMethodUpdate,
-    CheckoutUpdateMeta,
-    CheckoutUpdatePrivateMeta,
-    CheckoutUpdateVoucher,
+    OrderCreateFromCheckout,
 )
 from .resolvers import resolve_checkout, resolve_checkout_lines, resolve_checkouts
-from .types import Checkout, CheckoutLine
+from .sorters import CheckoutSortingInput
+from .types import (
+    Checkout,
+    CheckoutCountableConnection,
+    CheckoutLineCountableConnection,
+)
 
 
 class CheckoutQueries(graphene.ObjectType):
     checkout = graphene.Field(
         Checkout,
-        description="Look up a checkout by token.",
-        token=graphene.Argument(graphene.UUID, description="The checkout's token."),
+        description="Look up a checkout by token and slug of channel.",
+        token=graphene.Argument(UUID, description="The checkout's token."),
     )
     # FIXME we could optimize the below field
-    checkouts = BaseDjangoConnectionField(Checkout, description="List of checkouts.")
-    checkout_line = graphene.Field(
-        CheckoutLine,
-        id=graphene.Argument(graphene.ID, description="ID of the checkout line."),
-        description="Look up a checkout line by ID.",
+    checkouts = FilterConnectionField(
+        CheckoutCountableConnection,
+        sort_by=CheckoutSortingInput(description=f"{ADDED_IN_31} Sort checkouts."),
+        filter=CheckoutFilterInput(
+            description=f"{ADDED_IN_31} Filtering options for checkouts."
+        ),
+        channel=graphene.String(
+            description="Slug of a channel for which the data should be returned."
+        ),
+        description="List of checkouts.",
     )
-    checkout_lines = PrefetchingConnectionField(
-        CheckoutLine, description="List of checkout lines."
+    checkout_lines = ConnectionField(
+        CheckoutLineCountableConnection, description="List of checkout lines."
     )
 
-    def resolve_checkout(self, *_args, token):
-        return resolve_checkout(token)
+    def resolve_checkout(self, info, token):
+        return resolve_checkout(info, token)
 
-    @permission_required("order.manage_orders")
-    def resolve_checkouts(self, *_args, **_kwargs):
-        resolve_checkouts()
+    @permission_required(CheckoutPermissions.MANAGE_CHECKOUTS)
+    def resolve_checkouts(self, info, *_args, channel=None, **kwargs):
+        qs = resolve_checkouts(channel)
+        qs = filter_connection_queryset(qs, kwargs)
+        return create_connection_slice(qs, info, kwargs, CheckoutCountableConnection)
 
-    def resolve_checkout_line(self, info, id):
-        return graphene.Node.get_node_from_global_id(info, id, CheckoutLine)
-
-    @permission_required("order.manage_orders")
-    def resolve_checkout_lines(self, *_args, **_kwargs):
-        return resolve_checkout_lines()
+    @permission_required(CheckoutPermissions.MANAGE_CHECKOUTS)
+    def resolve_checkout_lines(self, info, *_args, **kwargs):
+        qs = resolve_checkout_lines()
+        return create_connection_slice(
+            qs, info, kwargs, CheckoutLineCountableConnection
+        )
 
 
 class CheckoutMutations(graphene.ObjectType):
@@ -67,15 +83,24 @@ class CheckoutMutations(graphene.ObjectType):
     checkout_customer_attach = CheckoutCustomerAttach.Field()
     checkout_customer_detach = CheckoutCustomerDetach.Field()
     checkout_email_update = CheckoutEmailUpdate.Field()
-    checkout_line_delete = CheckoutLineDelete.Field()
+    checkout_line_delete = CheckoutLineDelete.Field(
+        deprecation_reason=(
+            "DEPRECATED: Will be removed in Saleor 4.0. "
+            "Use `checkoutLinesDelete` instead."
+        )
+    )
+    checkout_lines_delete = CheckoutLinesDelete.Field()
     checkout_lines_add = CheckoutLinesAdd.Field()
     checkout_lines_update = CheckoutLinesUpdate.Field()
     checkout_remove_promo_code = CheckoutRemovePromoCode.Field()
     checkout_payment_create = CheckoutPaymentCreate.Field()
     checkout_shipping_address_update = CheckoutShippingAddressUpdate.Field()
-    checkout_shipping_method_update = CheckoutShippingMethodUpdate.Field()
-    checkout_update_voucher = CheckoutUpdateVoucher.Field()
-    checkout_update_metadata = CheckoutUpdateMeta.Field()
-    checkout_clear_metadata = CheckoutClearMeta.Field()
-    checkout_update_private_metadata = CheckoutUpdatePrivateMeta.Field()
-    checkout_clear_private_metadata = CheckoutClearPrivateMeta.Field()
+    checkout_shipping_method_update = CheckoutShippingMethodUpdate.Field(
+        deprecation_reason=(
+            f"{DEPRECATED_IN_3X_FIELD} " "Use `checkoutDeliveryMethodUpdate` instead."
+        )
+    )
+    checkout_delivery_method_update = CheckoutDeliveryMethodUpdate.Field()
+    checkout_language_code_update = CheckoutLanguageCodeUpdate.Field()
+
+    order_create_from_checkout = OrderCreateFromCheckout.Field()

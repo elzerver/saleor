@@ -1,31 +1,34 @@
 import django_filters
+import graphene
+from django.db.models import Q
 
 from ...menu.models import Menu, MenuItem
+from ..core.filters import ListObjectTypeFilter, MetadataFilterBase
 from ..core.types import FilterInputObjectType
-from ..utils import filter_by_query_param
 
 
 def filter_menu_search(qs, _, value):
-    menu_fields = ["name"]
-    qs = filter_by_query_param(qs, value, menu_fields)
-    return qs
+    return qs.filter(Q(name__ilike=value) | Q(slug__ilike=value))
+
+
+def filter_menu_slug(qs, _, value):
+    return qs.filter(slug__in=value)
 
 
 def filter_menu_item_search(qs, _, value):
-    menu_item_fields = ["name"]
-    qs = filter_by_query_param(qs, value, menu_item_fields)
-    return qs
+    return qs.filter(name__ilike=value)
 
 
-class MenuFilter(django_filters.FilterSet):
+class MenuFilter(MetadataFilterBase):
     search = django_filters.CharFilter(method=filter_menu_search)
+    slug = ListObjectTypeFilter(input_class=graphene.String, method=filter_menu_slug)
 
     class Meta:
         model = Menu
-        fields = ["search"]
+        fields = ["search", "slug"]
 
 
-class MenuItemFilter(django_filters.FilterSet):
+class MenuItemFilter(MetadataFilterBase):
     search = django_filters.CharFilter(method=filter_menu_item_search)
 
     class Meta:

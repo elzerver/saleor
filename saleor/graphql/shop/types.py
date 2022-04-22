@@ -1,44 +1,43 @@
+from typing import Optional
+
 import graphene
 from django.conf import settings
-from django.utils import translation
 from django_countries import countries
 from django_prices_vatlayer.models import VAT
 from phonenumbers import COUNTRY_CODE_TO_REGION_CODE
 
+from ... import __version__
 from ...account import models as account_models
-from ...core.permissions import get_permissions
-from ...core.utils import get_client_ip, get_country_by_ip
-from ...menu import models as menu_models
-from ...product import models as product_models
+from ...channel import models as channel_models
+from ...core.permissions import SitePermissions, get_permissions
+from ...core.tracing import traced_resolver
 from ...site import models as site_models
-from ..account.types import Address, StaffNotificationRecipient
-from ..core.enums import WeightUnitsEnum
-from ..core.types.common import CountryDisplay, LanguageDisplay, PermissionDisplay
-from ..core.utils import get_node_optimized, str_to_enum
-from ..decorators import permission_required
-from ..menu.types import Menu
-from ..product.types import Collection
-from ..translations.enums import LanguageCodeEnum
+from ..account.types import Address, AddressInput, StaffNotificationRecipient
+from ..checkout.types import PaymentGateway
+from ..core.descriptions import ADDED_IN_31, DEPRECATED_IN_3X_INPUT, PREVIEW_FEATURE
+from ..core.enums import LanguageCodeEnum, WeightUnitsEnum
+from ..core.types import (
+    CountryDisplay,
+    LanguageDisplay,
+    ModelObjectType,
+    NonNullList,
+    Permission,
+    TimePeriod,
+)
+from ..core.utils import str_to_enum
+from ..decorators import (
+    permission_required,
+    staff_member_or_app_required,
+    staff_member_required,
+)
+from ..shipping.types import ShippingMethod
 from ..translations.fields import TranslationField
 from ..translations.resolvers import resolve_translation
 from ..translations.types import ShopTranslation
 from ..utils import format_permissions_for_display
-from .enums import AuthorizationKeyType
-
-
-class Navigation(graphene.ObjectType):
-    main = graphene.Field(Menu, description="Main navigation bar.")
-    secondary = graphene.Field(Menu, description="Secondary navigation bar.")
-
-    class Meta:
-        description = "Represents shop's navigation menus."
-
-
-class AuthorizationKey(graphene.ObjectType):
-    name = AuthorizationKeyType(
-        description="Name of the authorization backend.", required=True
-    )
-    key = graphene.String(description="Authorization key (client ID).", required=True)
+from .enums import GiftCardSettingsExpiryTypeEnum
+from .filters import CountryFilterInput
+from .resolvers import resolve_available_shipping_methods, resolve_countries
 
 
 class Domain(graphene.ObjectType):
@@ -52,41 +51,129 @@ class Domain(graphene.ObjectType):
         description = "Represents shop's domain."
 
 
-class Geolocalization(graphene.ObjectType):
-    country = graphene.Field(
-        CountryDisplay, description="Country of the user acquired by his IP address."
+class OrderSettings(ModelObjectType):
+    automatically_confirm_all_new_orders = graphene.Boolean(required=True)
+    automatically_fulfill_non_shippable_gift_card = graphene.Boolean(required=True)
+
+    class Meta:
+        description = "Order related settings from site settings."
+        model = site_models.SiteSettings
+
+
+class GiftCardSettings(ModelObjectType):
+    expiry_type = GiftCardSettingsExpiryTypeEnum(
+        description="The gift card expiry type settings.", required=True
+    )
+    expiry_period = graphene.Field(
+        TimePeriod, description="The gift card expiry period settings.", required=False
     )
 
     class Meta:
-        description = "Represents customers's geolocalization data."
+        description = "Gift card related settings from site settings."
+        model = site_models.SiteSettings
+
+    def resolve_expiry_type(root, info):
+        return root.gift_card_expiry_type
+
+    def resolve_expiry_period(root, info):
+        if root.gift_card_expiry_period_type is None:
+            return None
+        return TimePeriod(
+            amount=root.gift_card_expiry_period, type=root.gift_card_expiry_period_type
+        )
+
+
+class ExternalAuthentication(graphene.ObjectType):
+    id = graphene.String(
+        description="ID of external authentication plugin.", required=True
+    )
+    name = graphene.String(description="Name of external authentication plugin.")
+
+
+class Limits(graphene.ObjectType):
+    channels = graphene.Int()
+    orders = graphene.Int()
+    product_variants = graphene.Int()
+    staff_users = graphene.Int()
+    warehouses = graphene.Int()
+
+
+class LimitInfo(graphene.ObjectType):
+    current_usage = graphene.Field(
+        Limits,
+        required=True,
+        description="Defines the current resource usage.",
+    )
+    allowed_usage = graphene.Field(
+        Limits,
+        required=True,
+        description="Defines the allowed maximum resource usage, null means unlimited.",
+    )
 
 
 class Shop(graphene.ObjectType):
-    geolocalization = graphene.Field(
-        Geolocalization, description="Customer's geolocalization data."
+    available_payment_gateways = NonNullList(
+        PaymentGateway,
+        currency=graphene.Argument(
+            graphene.String,
+            description=(
+                "A currency for which gateways will be returned. "
+                f"{DEPRECATED_IN_3X_INPUT} Use `channel` argument instead."
+            ),
+            required=False,
+        ),
+        channel=graphene.Argument(
+            graphene.String,
+            description="Slug of a channel for which the data should be returned.",
+            required=False,
+        ),
+        description="List of available payment gateways.",
+        required=True,
     )
-    authorization_keys = graphene.List(
-        AuthorizationKey,
+    available_external_authentications = NonNullList(
+        ExternalAuthentication,
+        description="List of available external authentications.",
+        required=True,
+    )
+    available_shipping_methods = NonNullList(
+        ShippingMethod,
+        channel=graphene.Argument(
+            graphene.String,
+            description="Slug of a channel for which the data should be returned.",
+            required=True,
+        ),
+        address=graphene.Argument(
+            AddressInput,
+            description=(
+                "Address for which available shipping methods should be returned."
+            ),
+            required=False,
+        ),
+        required=False,
+        description="Shipping methods that are available for the shop.",
+    )
+    channel_currencies = NonNullList(
+        graphene.String,
         description=(
-            "List of configured authorization keys. Authorization keys are used to "
-            "enable third-party OAuth authorization (currently Facebook or Google)."
+            f"{ADDED_IN_31} List of all currencies supported by shop's channels."
         ),
         required=True,
     )
-    countries = graphene.List(
+    countries = NonNullList(
         CountryDisplay,
         language_code=graphene.Argument(
             LanguageCodeEnum,
-            description="A language code to return the translation for.",
+            description=(
+                "A language code to return the translation for. "
+                f"{DEPRECATED_IN_3X_INPUT}"
+            ),
+        ),
+        filter=CountryFilterInput(
+            description="Filtering options for countries",
+            required=False,
         ),
         description="List of countries available in the shop.",
         required=True,
-    )
-    currencies = graphene.List(
-        graphene.String, description="List of available currencies.", required=True
-    )
-    default_currency = graphene.String(
-        description="Shop's default currency.", required=True
     )
     default_country = graphene.Field(
         CountryDisplay, description="Shop's default country."
@@ -99,25 +186,29 @@ class Shop(graphene.ObjectType):
     )
     description = graphene.String(description="Shop's description.")
     domain = graphene.Field(Domain, required=True, description="Shop's domain data.")
-    homepage_collection = graphene.Field(
-        Collection, description="Collection displayed on homepage."
-    )
-    languages = graphene.List(
+    languages = NonNullList(
         LanguageDisplay,
         description="List of the shops's supported languages.",
         required=True,
     )
     name = graphene.String(description="Shop's name.", required=True)
-    navigation = graphene.Field(Navigation, description="Shop's navigation.")
-    permissions = graphene.List(
-        PermissionDisplay, description="List of available permissions.", required=True
+    permissions = NonNullList(
+        Permission, description="List of available permissions.", required=True
     )
-    phone_prefixes = graphene.List(
+    phone_prefixes = NonNullList(
         graphene.String, description="List of possible phone prefixes.", required=True
     )
     header_text = graphene.String(description="Header text.")
     include_taxes_in_prices = graphene.Boolean(
         description="Include taxes in prices.", required=True
+    )
+    fulfillment_auto_approve = graphene.Boolean(
+        description=f"{ADDED_IN_31} Automatically approve all new fulfillments.",
+        required=True,
+    )
+    fulfillment_allow_unpaid = graphene.Boolean(
+        description=f"{ADDED_IN_31} Allow to approve fulfillments which are unpaid.",
+        required=True,
     )
     display_gross_prices = graphene.Boolean(
         description="Display prices with tax in store.", required=True
@@ -134,6 +225,25 @@ class Shop(graphene.ObjectType):
         description="Enable automatic fulfillment for all digital products."
     )
 
+    reserve_stock_duration_anonymous_user = graphene.Int(
+        description=(
+            f"{ADDED_IN_31} Default number of minutes stock will be reserved for "
+            "anonymous checkout or null when stock reservation is disabled."
+        )
+    )
+    reserve_stock_duration_authenticated_user = graphene.Int(
+        description=(
+            f"{ADDED_IN_31} Default number of minutes stock will be reserved for "
+            "authenticated checkout or null when stock reservation is disabled."
+        )
+    )
+    limit_quantity_per_checkout = graphene.Int(
+        description=(
+            f"{ADDED_IN_31} Default number of maximum line quantity in single checkout "
+            f"(per single checkout line). {PREVIEW_FEATURE}"
+        )
+    )
+
     default_digital_max_downloads = graphene.Int(
         description="Default number of max downloads per digital content URL."
     )
@@ -147,11 +257,17 @@ class Shop(graphene.ObjectType):
         description="URL of a view where customers can set their password.",
         required=False,
     )
-    staff_notification_recipients = graphene.List(
+    staff_notification_recipients = NonNullList(
         StaffNotificationRecipient,
         description="List of staff notification recipients.",
         required=False,
     )
+    limits = graphene.Field(
+        LimitInfo,
+        required=True,
+        description="Resource limitations and current usage if any set for a shop",
+    )
+    version = graphene.String(description="Saleor API version.", required=True)
 
     class Meta:
         description = (
@@ -159,24 +275,33 @@ class Shop(graphene.ObjectType):
         )
 
     @staticmethod
-    @permission_required("site.manage_settings")
-    def resolve_authorization_keys(_, _info):
-        return site_models.AuthorizationKey.objects.all()
+    @traced_resolver
+    def resolve_available_payment_gateways(
+        _, info, currency: Optional[str] = None, channel: Optional[str] = None
+    ):
+        return info.context.plugins.list_payment_gateways(
+            currency=currency, channel_slug=channel
+        )
 
     @staticmethod
-    def resolve_countries(_, _info, language_code=None):
-        taxes = {vat.country_code: vat for vat in VAT.objects.all()}
-        with translation.override(language_code):
-            return [
-                CountryDisplay(
-                    code=country[0], country=country[1], vat=taxes.get(country[0])
-                )
-                for country in countries
-            ]
+    @traced_resolver
+    def resolve_available_external_authentications(_, info):
+        return info.context.plugins.list_external_authentications(active_only=True)
 
     @staticmethod
-    def resolve_currencies(_, _info):
-        return settings.AVAILABLE_CURRENCIES
+    def resolve_available_shipping_methods(_, info, channel, address=None):
+        return resolve_available_shipping_methods(info, channel, address)
+
+    @staticmethod
+    @staff_member_or_app_required
+    def resolve_channel_currencies(_, info):
+        return set(
+            channel_models.Channel.objects.values_list("currency_code", flat=True)
+        )
+
+    @staticmethod
+    def resolve_countries(_, _info, **kwargs):
+        return resolve_countries(**kwargs)
 
     @staticmethod
     def resolve_domain(_, info):
@@ -188,28 +313,8 @@ class Shop(graphene.ObjectType):
         )
 
     @staticmethod
-    def resolve_geolocalization(_, info):
-        client_ip = get_client_ip(info.context)
-        country = get_country_by_ip(client_ip)
-        if country:
-            return Geolocalization(
-                country=CountryDisplay(code=country.code, country=country.name)
-            )
-        return Geolocalization(country=None)
-
-    @staticmethod
-    def resolve_default_currency(_, _info):
-        return settings.DEFAULT_CURRENCY
-
-    @staticmethod
     def resolve_description(_, info):
         return info.context.site.settings.description
-
-    @staticmethod
-    def resolve_homepage_collection(_, info):
-        collection_pk = info.context.site.settings.homepage_collection_id
-        qs = product_models.Collection.objects.all()
-        return get_node_optimized(qs, {"pk": collection_pk}, info)
 
     @staticmethod
     def resolve_languages(_, _info):
@@ -225,14 +330,7 @@ class Shop(graphene.ObjectType):
         return info.context.site.name
 
     @staticmethod
-    def resolve_navigation(_, info):
-        site_settings = info.context.site.settings
-        qs = menu_models.Menu.objects.all()
-        top_menu = get_node_optimized(qs, {"pk": site_settings.top_menu_id}, info)
-        bottom_menu = get_node_optimized(qs, {"pk": site_settings.bottom_menu_id}, info)
-        return Navigation(main=top_menu, secondary=bottom_menu)
-
-    @staticmethod
+    @traced_resolver
     def resolve_permissions(_, _info):
         permissions = get_permissions()
         return format_permissions_for_display(permissions)
@@ -248,6 +346,14 @@ class Shop(graphene.ObjectType):
     @staticmethod
     def resolve_include_taxes_in_prices(_, info):
         return info.context.site.settings.include_taxes_in_prices
+
+    @staticmethod
+    def resolve_fulfillment_auto_approve(_, info):
+        return info.context.site.settings.fulfillment_auto_approve
+
+    @staticmethod
+    def resolve_fulfillment_allow_unpaid(_, info):
+        return info.context.site.settings.fulfillment_allow_unpaid
 
     @staticmethod
     def resolve_display_gross_prices(_, info):
@@ -266,6 +372,7 @@ class Shop(graphene.ObjectType):
         return info.context.site.settings.default_weight_unit
 
     @staticmethod
+    @traced_resolver
     def resolve_default_country(_, _info):
         default_country_code = settings.DEFAULT_COUNTRY
         default_country_name = countries.countries.get(default_country_code)
@@ -279,12 +386,12 @@ class Shop(graphene.ObjectType):
         return default_country
 
     @staticmethod
-    @permission_required("site.manage_settings")
+    @permission_required(SitePermissions.MANAGE_SETTINGS)
     def resolve_default_mail_sender_name(_, info):
         return info.context.site.settings.default_mail_sender_name
 
     @staticmethod
-    @permission_required("site.manage_settings")
+    @permission_required(SitePermissions.MANAGE_SETTINGS)
     def resolve_default_mail_sender_address(_, info):
         return info.context.site.settings.default_mail_sender_address
 
@@ -301,22 +408,50 @@ class Shop(graphene.ObjectType):
         return resolve_translation(info.context.site.settings, info, language_code)
 
     @staticmethod
-    @permission_required("site.manage_settings")
+    @permission_required(SitePermissions.MANAGE_SETTINGS)
     def resolve_automatic_fulfillment_digital_products(_, info):
         site_settings = info.context.site.settings
         return site_settings.automatic_fulfillment_digital_products
 
     @staticmethod
-    @permission_required("site.manage_settings")
+    @permission_required(SitePermissions.MANAGE_SETTINGS)
+    def resolve_reserve_stock_duration_anonymous_user(_, info):
+        site_settings = info.context.site.settings
+        return site_settings.reserve_stock_duration_anonymous_user
+
+    @staticmethod
+    @permission_required(SitePermissions.MANAGE_SETTINGS)
+    def resolve_reserve_stock_duration_authenticated_user(_, info):
+        site_settings = info.context.site.settings
+        return site_settings.reserve_stock_duration_authenticated_user
+
+    @staticmethod
+    @permission_required(SitePermissions.MANAGE_SETTINGS)
+    def resolve_limit_quantity_per_checkout(_, info):
+        site_settings = info.context.site.settings
+        return site_settings.limit_quantity_per_checkout
+
+    @staticmethod
+    @permission_required(SitePermissions.MANAGE_SETTINGS)
     def resolve_default_digital_max_downloads(_, info):
         return info.context.site.settings.default_digital_max_downloads
 
     @staticmethod
-    @permission_required("site.manage_settings")
+    @permission_required(SitePermissions.MANAGE_SETTINGS)
     def resolve_default_digital_url_valid_days(_, info):
         return info.context.site.settings.default_digital_url_valid_days
 
     @staticmethod
-    @permission_required("site.manage_settings")
+    @permission_required(SitePermissions.MANAGE_SETTINGS)
     def resolve_staff_notification_recipients(_, info):
         return account_models.StaffNotificationRecipient.objects.all()
+
+    @staticmethod
+    @staff_member_required
+    def resolve_limits(_, _info):
+        return LimitInfo(current_usage=Limits(), allowed_usage=Limits())
+
+    @staticmethod
+    @staff_member_or_app_required
+    def resolve_version(_, _info):
+        return __version__
